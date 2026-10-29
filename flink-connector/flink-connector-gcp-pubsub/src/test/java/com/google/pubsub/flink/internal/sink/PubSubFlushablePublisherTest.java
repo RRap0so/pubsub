@@ -17,6 +17,7 @@ package com.google.pubsub.flink.internal.sink;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -25,8 +26,10 @@ import com.google.api.core.SettableApiFuture;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.protobuf.ByteString;
 import com.google.pubsub.v1.PubsubMessage;
+import java.io.IOException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -70,7 +73,7 @@ public class PubSubFlushablePublisherTest {
     flushablePublisher.publish(message2);
     verify(mockPublisher).publish(message2);
 
-    assertThrows(RuntimeException.class, flushablePublisher::flush);
+    assertThrows(IOException.class, flushablePublisher::flush);
   }
 
   @Test
@@ -83,11 +86,135 @@ public class PubSubFlushablePublisherTest {
     flushablePublisher.publish(message);
     verify(mockPublisher).publish(message);
 
-    Future<?> flushFuture =
-        Executors.newSingleThreadExecutor().submit(() -> flushablePublisher.flush());
-    assertThat(flushFuture.isDone()).isFalse();
+    var executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> flushFuture =
+          executor.submit(
+              () -> {
+                flushablePublisher.flush();
+                return null;
+              });
+      assertThat(flushFuture.isDone()).isFalse();
+      messageFuture.set("ack-id");
+      flushFuture.get(5, TimeUnit.SECONDS);
+    } finally {
+      executor.shutdownNow();
+    }
+  }
 
-    messageFuture.set("ack-id");
-    flushFuture.get();
+  @Test
+  public void flush_preservesInterruptionAndDoesNotForgetOutstandingPublish() throws Exception {
+    PubsubMessage message = PubsubMessage.getDefaultInstance();
+    var result = SettableApiFuture.<String>create();
+    when(mockPublisher.publish(message)).thenReturn(result);
+    flushablePublisher.publish(message);
+    try {
+      Thread.currentThread().interrupt();
+      IOException failure = assertThrows(IOException.class, flushablePublisher::flush);
+      assertThat(failure).hasCauseThat().isInstanceOf(InterruptedException.class);
+      assertThat(Thread.currentThread().isInterrupted()).isTrue();
+    } finally {
+      Thread.interrupted();
+    }
+    RuntimeException publishFailure = new RuntimeException("rejected publication");
+    result.setException(publishFailure);
+    IOException failure = assertThrows(IOException.class, flushablePublisher::flush);
+    assertThat(failure).hasCauseThat().isSameInstanceAs(publishFailure);
+  }
+
+  @Test
+  public void flush_asyncFailureRemainsVisibleOnSubsequentFlush() throws Exception {
+    PubsubMessage message = PubsubMessage.getDefaultInstance();
+    RuntimeException failure = new RuntimeException("rejected publication");
+    when(mockPublisher.publish(message)).thenReturn(ApiFutures.immediateFailedFuture(failure));
+    flushablePublisher.publish(message);
+    assertThat(assertThrows(IOException.class, flushablePublisher::flush))
+        .hasCauseThat()
+        .isSameInstanceAs(failure);
+    assertThat(assertThrows(IOException.class, flushablePublisher::flush))
+        .hasCauseThat()
+        .isSameInstanceAs(failure);
+  }
+
+  @Test
+  public void close_flushesShutsDownAndWaitsOnce() throws Exception {
+    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    flushablePublisher.close();
+    flushablePublisher.close();
+    verify(mockPublisher).publishAllOutstanding();
+    verify(mockPublisher).shutdown();
+    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
+    assertThrows(
+        IllegalStateException.class,
+        () -> flushablePublisher.publish(PubsubMessage.getDefaultInstance()));
+  }
+
+  @Test
+  public void close_flushFailureStillShutsDownAndPreservesProviderCause() throws Exception {
+    PubsubMessage message = PubsubMessage.getDefaultInstance();
+    RuntimeException failure = new RuntimeException("rejected publication");
+    when(mockPublisher.publish(message)).thenReturn(ApiFutures.immediateFailedFuture(failure));
+    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    flushablePublisher.publish(message);
+    assertThat(assertThrows(IOException.class, flushablePublisher::close))
+        .hasCauseThat()
+        .isSameInstanceAs(failure);
+    verify(mockPublisher).shutdown();
+    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void close_keepsFlushFailureWhenShutdownAlsoFails() throws Exception {
+    PubsubMessage message = PubsubMessage.getDefaultInstance();
+    RuntimeException publishFailure = new RuntimeException("rejected publication");
+    RuntimeException shutdownFailure = new RuntimeException("shutdown failure");
+    when(mockPublisher.publish(message))
+        .thenReturn(ApiFutures.immediateFailedFuture(publishFailure));
+    doThrow(shutdownFailure).when(mockPublisher).shutdown();
+    flushablePublisher.publish(message);
+    IOException failure = assertThrows(IOException.class, flushablePublisher::close);
+    assertThat(failure).hasCauseThat().isSameInstanceAs(publishFailure);
+    assertThat(failure.getSuppressed()).hasLength(1);
+    assertThat(failure.getSuppressed()[0]).hasCauseThat().isSameInstanceAs(shutdownFailure);
+  }
+
+  @Test
+  public void close_shutdownWaitInterruptionPreservesFlag() throws Exception {
+    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS))
+        .thenThrow(new InterruptedException("shutdown interrupted"));
+    try {
+      IOException failure = assertThrows(IOException.class, flushablePublisher::close);
+      assertThat(failure).hasCauseThat().isInstanceOf(InterruptedException.class);
+      assertThat(Thread.currentThread().isInterrupted()).isTrue();
+      verify(mockPublisher).shutdown();
+    } finally {
+      Thread.interrupted();
+    }
+  }
+
+  @Test
+  public void close_interruptedFlushStillAttemptsShutdown() throws Exception {
+    PubsubMessage message = PubsubMessage.getDefaultInstance();
+    when(mockPublisher.publish(message)).thenReturn(SettableApiFuture.create());
+    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    flushablePublisher.publish(message);
+    try {
+      Thread.currentThread().interrupt();
+      IOException failure = assertThrows(IOException.class, flushablePublisher::close);
+      assertThat(failure).hasCauseThat().isInstanceOf(InterruptedException.class);
+      assertThat(Thread.currentThread().isInterrupted()).isTrue();
+      verify(mockPublisher).shutdown();
+      verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
+    } finally {
+      Thread.interrupted();
+    }
+  }
+
+  @Test
+  public void close_terminationTimeoutIsReported() throws Exception {
+    IOException failure = assertThrows(IOException.class, flushablePublisher::close);
+    assertThat(failure).hasMessageThat().contains("did not terminate");
+    verify(mockPublisher).shutdown();
+    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
   }
 }

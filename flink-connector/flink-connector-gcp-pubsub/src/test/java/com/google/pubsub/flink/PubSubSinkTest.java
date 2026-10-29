@@ -15,9 +15,23 @@
  */
 package com.google.pubsub.flink;
 
+import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.google.cloud.pubsub.v1.Publisher;
+import com.google.pubsub.v1.TopicName;
+import java.io.IOException;
+import java.util.concurrent.TimeUnit;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.junit.MockitoJUnitRunner;
@@ -71,5 +85,55 @@ public class PubSubSinkTest {
   @Test
   public void build_invalidEndpoint() throws Exception {
     assertThrows(NullPointerException.class, () -> PubSubSink.<String>builder().setEndpoint(null));
+  }
+
+  @Test
+  public void writersWithSameTopicAndDifferentConfigurationOwnSeparatePublishers()
+      throws Exception {
+    var first = spy(sinkBuilder().setEndpoint("emulator:///127.0.0.1:23456").build());
+    var second =
+        spy(
+            sinkBuilder()
+                .setEndpoint("emulator:///127.0.0.1:23457")
+                .setEnableMessageOrdering(true)
+                .build());
+    Publisher firstPublisher = mock(Publisher.class);
+    Publisher secondPublisher = mock(Publisher.class);
+    doReturn(firstPublisher).when(first).createPublisher(TopicName.of("project", "topic"));
+    doReturn(secondPublisher).when(second).createPublisher(TopicName.of("project", "topic"));
+    when(firstPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    when(secondPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    var firstWriter = first.createWriter(mock(WriterInitContext.class));
+    var secondWriter = second.createWriter(mock(WriterInitContext.class));
+    try {
+      firstWriter.close();
+      verify(firstPublisher).shutdown();
+      verify(secondPublisher, never()).shutdown();
+      secondWriter.close();
+      verify(secondPublisher).shutdown();
+    } finally {
+      firstWriter.close();
+      secondWriter.close();
+    }
+  }
+
+  @Test
+  public void schemaOpenFailureDoesNotAllocatePublisher() throws Exception {
+    PubSubSerializationSchema<String> schema = mock(PubSubSerializationSchema.class);
+    IOException failure = new IOException("schema open failed");
+    doThrow(failure).when(schema).open(any());
+    var sink = spy(sinkBuilder().setSerializationSchema(schema).build());
+    assertThat(
+            assertThrows(IOException.class, () -> sink.createWriter(mock(WriterInitContext.class))))
+        .hasCauseThat()
+        .isSameInstanceAs(failure);
+    verify(sink, never()).createPublisher(any(TopicName.class));
+  }
+
+  private static PubSubSink.Builder<String> sinkBuilder() {
+    return PubSubSink.<String>builder()
+        .setProjectName("project")
+        .setTopicName("topic")
+        .setSerializationSchema(PubSubSerializationSchema.dataOnly(new SimpleStringSchema()));
   }
 }

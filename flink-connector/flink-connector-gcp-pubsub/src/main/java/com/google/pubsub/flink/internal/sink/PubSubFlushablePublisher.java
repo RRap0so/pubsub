@@ -19,12 +19,17 @@ import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.pubsub.v1.PubsubMessage;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 public class PubSubFlushablePublisher implements FlushablePublisher {
-  Publisher publisher;
-  List<ApiFuture<String>> outstandingPublishes = new ArrayList<>();
+  private final Publisher publisher;
+  private final List<ApiFuture<String>> outstandingPublishes = new ArrayList<>();
+  private boolean closed;
 
   public PubSubFlushablePublisher(Publisher publisher) {
     this.publisher = publisher;
@@ -32,17 +37,71 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
 
   @Override
   public void publish(PubsubMessage message) throws InterruptedException {
+    if (closed) {
+      throw new IllegalStateException("Publisher is closed");
+    }
     outstandingPublishes.add(publisher.publish(message));
   }
 
   @Override
-  public void flush() {
+  public void flush() throws IOException {
     publisher.publishAllOutstanding();
     try {
       ApiFutures.allAsList(outstandingPublishes).get();
       outstandingPublishes.clear();
-    } catch (Exception e) {
-      throw new RuntimeException(e);
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while waiting for Pub/Sub publishes", interrupted);
+    } catch (ExecutionException failed) {
+      throw new IOException("Pub/Sub publish failed", failed.getCause());
+    } catch (CancellationException cancelled) {
+      throw new IOException("Pub/Sub publish was cancelled", cancelled);
+    }
+  }
+
+  @Override
+  public void close() throws IOException {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    IOException failure = null;
+    try {
+      flush();
+    } catch (IOException failed) {
+      failure = failed;
+    } catch (RuntimeException failed) {
+      failure = new IOException("Unable to flush Pub/Sub publisher during close", failed);
+    } finally {
+      try {
+        // SDK shutdown itself drains pending requests. Bound the subsequent resource wait.
+        publisher.shutdown();
+        if (!publisher.awaitTermination(30, TimeUnit.SECONDS)) {
+          throw new IOException("Pub/Sub publisher did not terminate within 30 seconds");
+        }
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        IOException cleanup =
+            new IOException("Interrupted while closing Pub/Sub publisher", interrupted);
+        if (failure == null) {
+          failure = cleanup;
+        } else {
+          failure.addSuppressed(cleanup);
+        }
+      } catch (IOException | RuntimeException failed) {
+        IOException cleanup =
+            failed instanceof IOException
+                ? (IOException) failed
+                : new IOException("Unable to shut down Pub/Sub publisher", failed);
+        if (failure == null) {
+          failure = cleanup;
+        } else {
+          failure.addSuppressed(cleanup);
+        }
+      }
+    }
+    if (failure != null) {
+      throw failure;
     }
   }
 }
