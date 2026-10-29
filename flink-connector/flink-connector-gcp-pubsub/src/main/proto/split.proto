@@ -33,4 +33,13 @@ message PubSubEnumeratorCheckpoint {
     SubscriptionSplitProto split = 2;
   }
   repeated Assignment assignments = 1;
+  // Empty for checkpoints made without replay snapshot recovery.
+  string replay_snapshot_namespace = 2;
+  int64 replay_checkpoint_id = 3;
+  message ReplaySnapshot {
+    int64 checkpoint_id = 1;
+    string name = 2;
+  }
+  repeated ReplaySnapshot replay_snapshots = 4;
+  string replay_subscription = 5;
 }
