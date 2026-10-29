@@ -51,8 +51,10 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.execution.CheckpointType;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.metrics.Counter;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.runtime.testutils.InMemoryReporter;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -70,6 +72,7 @@ import org.junit.rules.TemporaryFolder;
 /** Recovery scenarios with actual Flink jobs, checkpoints and managed operator state. */
 public class PubSubRecoveryIT {
   private static MiniClusterWithClientResource cluster;
+  private static InMemoryReporter metrics;
   private static final Map<String, List<String>> OUTPUT = new ConcurrentHashMap<>();
   private static final Map<String, String> COMPLETED = new ConcurrentHashMap<>();
   private static final Map<String, AtomicBoolean> FAIL_B_ONCE = new ConcurrentHashMap<>();
@@ -90,6 +93,8 @@ public class PubSubRecoveryIT {
     config.setString("rest.bind-address", "127.0.0.1");
     config.setString("rest.address", "127.0.0.1");
     config.setString("rest.bind-port", "0");
+    metrics = InMemoryReporter.create();
+    metrics.addToConfiguration(config);
     cluster =
         new MiniClusterWithClientResource(
             new MiniClusterResourceConfiguration.Builder()
@@ -102,8 +107,14 @@ public class PubSubRecoveryIT {
 
   @AfterClass
   public static void stopCluster() {
-    if (cluster != null) {
-      cluster.after();
+    try {
+      if (cluster != null) {
+        cluster.after();
+      }
+    } finally {
+      if (metrics != null) {
+        metrics.close();
+      }
     }
   }
 
@@ -273,6 +284,8 @@ public class PubSubRecoveryIT {
         original
             .triggerSavepoint(savepointDir(), SavepointFormatType.CANONICAL)
             .get(20, TimeUnit.SECONDS);
+    publish("B");
+    await(() -> OUTPUT.get(firstRun).contains("B|A,B"), "B processed after the savepoint");
     cluster
         .getClusterClient()
         .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
@@ -283,14 +296,32 @@ public class PubSubRecoveryIT {
     String secondRun = runId();
     JobClient restored = startJob(secondRun, savepoint, false, 2, restoredParallelism, true);
     publish("C");
-    await(() -> OUTPUT.get(secondRun).contains("C|A,C"), "new input updates restored state once");
+    await(() -> OUTPUT.get(secondRun).size() >= 2, "acknowledged B replayed alongside new C");
+    await(() -> duplicateDrops(restored) >= 1, "replayed A observed and filtered by the ID index");
     cluster
         .getClusterClient()
         .triggerCheckpoint(restored.getJobID(), CheckpointType.FULL)
         .get(20, TimeUnit.SECONDS);
     cancel(restored);
-    assertSubscriptionDrained(); // Replayed A must have been consumed and acknowledged, not lost.
-    assertEquals(List.of("C|A,C"), OUTPUT.get(secondRun));
+    assertSubscriptionDrained();
+    List<String> output = OUTPUT.get(secondRun);
+    assertEquals(2, output.size());
+    assertEquals(
+        java.util.Set.of("B", "C"),
+        output.stream()
+            .map(value -> value.split("\\|", 2)[0])
+            .collect(java.util.stream.Collectors.toSet()));
+    String lastState = output.get(output.size() - 1).split("\\|", 2)[1];
+    assertEquals(3, lastState.split(",").length);
+    assertEquals(
+        java.util.Set.of("A", "B", "C"),
+        java.util.Set.copyOf(java.util.Arrays.asList(lastState.split(","))));
+  }
+
+  private long duplicateDrops(JobClient job) {
+    return metrics.findMetrics(job.getJobID(), ".*pubsubReplayDuplicatesDropped").values().stream()
+        .mapToLong(metric -> ((Counter) metric).getCount())
+        .sum();
   }
 
   public static class KeyedSessionAccumulator extends RichMapFunction<String, String> {

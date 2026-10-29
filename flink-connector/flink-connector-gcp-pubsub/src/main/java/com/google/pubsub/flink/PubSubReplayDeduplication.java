@@ -30,6 +30,7 @@ import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.core.execution.CheckpointingMode;
+import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -137,6 +138,7 @@ public final class PubSubReplayDeduplication {
       extends KeyedProcessFunction<String, Tuple2<String, byte[]>, Tuple2<String, byte[]>> {
     private final Duration retention;
     private transient ValueState<Boolean> seen;
+    private transient Counter duplicatesDropped;
 
     Deduplicate(Duration retention) {
       this.retention = retention;
@@ -152,6 +154,8 @@ public final class PubSubReplayDeduplication {
               .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
               .build());
       seen = getRuntimeContext().getState(descriptor);
+      duplicatesDropped =
+          getRuntimeContext().getMetricGroup().counter("pubsubReplayDuplicatesDropped");
     }
 
     @Override
@@ -161,6 +165,8 @@ public final class PubSubReplayDeduplication {
       if (seen.value() == null) {
         seen.update(true);
         out.collect(value);
+      } else {
+        duplicatesDropped.inc();
       }
     }
   }
