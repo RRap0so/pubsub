@@ -23,7 +23,7 @@ public class PubSubCheckpointSerializer
     implements SimpleVersionedSerializer<PubSubEnumeratorCheckpoint> {
   @Override
   public int getVersion() {
-    return 1;
+    return 2;
   }
 
   @Override

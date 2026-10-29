@@ -38,6 +38,7 @@ public class PubSubSplitEnumerator
   private final SplitEnumeratorContext<SubscriptionSplit> context;
   private final HashMap<Integer, SubscriptionSplit> readersWithAssignments;
   @Nullable private final PubSubReplaySnapshots replaySnapshots;
+  private final boolean replayDeduplicationRequired;
 
   public PubSubSplitEnumerator(
       ProjectSubscriptionName subscriptionName,
@@ -51,6 +52,16 @@ public class PubSubSplitEnumerator
       SplitEnumeratorContext<SubscriptionSplit> context,
       HashMap<Integer, SubscriptionSplit> readersWithAssignments,
       @Nullable PubSubReplaySnapshots replaySnapshots) {
+    this(subscriptionName, context, readersWithAssignments, replaySnapshots, false);
+  }
+
+  public PubSubSplitEnumerator(
+      ProjectSubscriptionName subscriptionName,
+      SplitEnumeratorContext<SubscriptionSplit> context,
+      HashMap<Integer, SubscriptionSplit> readersWithAssignments,
+      @Nullable PubSubReplaySnapshots replaySnapshots,
+      boolean replayDeduplicationRequired) {
+    this.replayDeduplicationRequired = replayDeduplicationRequired;
     this.subscriptionName = subscriptionName;
     this.context = context;
     this.readersWithAssignments = readersWithAssignments;
@@ -87,7 +98,9 @@ public class PubSubSplitEnumerator
                   .build());
         });
     PubSubEnumeratorCheckpoint.Builder checkpoint =
-        PubSubEnumeratorCheckpoint.newBuilder().addAllAssignments(assignments);
+        PubSubEnumeratorCheckpoint.newBuilder()
+            .addAllAssignments(assignments)
+            .setReplayDeduplicationRequired(replayDeduplicationRequired);
     if (replaySnapshots != null) {
       checkpoint.setReplaySubscription(subscriptionName.toString());
       // Flink checkpoints coordinators before triggering task barriers. Create the shared
