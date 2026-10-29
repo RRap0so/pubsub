@@ -15,6 +15,7 @@
  */
 package com.google.pubsub.flink.internal.source.reader;
 
+import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -56,6 +57,75 @@ public class PubSubAckTrackerTest {
     ackTracker.notifyCheckpointComplete(1L);
     verify(mockAck1, times(0)).ack();
     verify(mockAck2, times(1)).ack();
+  }
+
+  @Test
+  public void redeliveryAfterSnapshot_ackLatestDeliveryOnOriginalCheckpoint() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer redelivery = mock(AckReplyConsumer.class);
+    ackTracker.addPendingAck("message-id", original);
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addCheckpoint(1L);
+
+    ackTracker.addPendingAck("message-id", redelivery);
+    ackTracker.notifyCheckpointComplete(1L);
+
+    verify(original, times(0)).ack();
+    verify(redelivery).ack();
+    ackTracker.nackAll();
+    verify(redelivery, times(0)).nack();
+  }
+
+  @Test
+  public void redeliveryAfterEmission_nackOnlyLatestDeliveryOnShutdown() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer redelivery = mock(AckReplyConsumer.class);
+    ackTracker.addPendingAck("message-id", original);
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addPendingAck("message-id", redelivery);
+
+    ackTracker.nackAll();
+
+    verify(original, times(0)).nack();
+    verify(redelivery).nack();
+  }
+
+  @Test
+  public void redeliveryAfterEmission_ackLatestDeliveryWhenCheckpointCompletes() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer redelivery = mock(AckReplyConsumer.class);
+    assertThat(ackTracker.trackMessageDelivery("message-id", original)).isTrue();
+    ackTracker.stagePendingAck("message-id");
+    assertThat(ackTracker.trackMessageDelivery("message-id", redelivery)).isFalse();
+    ackTracker.addCheckpoint(1L);
+    ackTracker.notifyCheckpointComplete(1L);
+
+    verify(original, times(0)).ack();
+    verify(redelivery).ack();
+  }
+
+  @Test
+  public void completedCheckpoint_releasesMessageIdForFutureDelivery() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    assertThat(ackTracker.trackMessageDelivery("message-id", original)).isTrue();
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addCheckpoint(1L);
+    ackTracker.notifyCheckpointComplete(1L);
+
+    assertThat(ackTracker.trackMessageDelivery("message-id", mock(AckReplyConsumer.class)))
+        .isTrue();
+  }
+
+  @Test
+  public void shutdown_releasesMessageIdForFutureDelivery() {
+    assertThat(ackTracker.trackMessageDelivery("message-id", mock(AckReplyConsumer.class)))
+        .isTrue();
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addCheckpoint(1L);
+    ackTracker.nackAll();
+
+    assertThat(ackTracker.trackMessageDelivery("message-id", mock(AckReplyConsumer.class)))
+        .isTrue();
   }
 
   @Test

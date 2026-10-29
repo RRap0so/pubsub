@@ -36,7 +36,9 @@ import org.mockito.junit.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
 public class PubSubNotifyingPullSubscriberTest {
-  @Mock AckTracker mockAckTracker;
+  @Mock(answer = org.mockito.Answers.CALLS_REAL_METHODS)
+  AckTracker mockAckTracker;
+
   @Mock Subscriber mockSubscriber;
 
   PubSubNotifyingPullSubscriber pullSubscriber;
@@ -71,6 +73,44 @@ public class PubSubNotifyingPullSubscriberTest {
     assertThat(notification.isDone()).isTrue();
     assertThat(pullSubscriber.pullMessage().get()).isEqualTo(message);
     verify(mockAckTracker).addPendingAck("message-id", consumer);
+  }
+
+  @Test
+  public void redeliveryBeforeEmission_queuesMessageOnlyOnce() throws Throwable {
+    PubSubAckTracker tracker = new PubSubAckTracker();
+    PubSubNotifyingPullSubscriber subscriber =
+        new PubSubNotifyingPullSubscriber(
+            messageReceiver -> {
+              receiver = messageReceiver;
+              return mockSubscriber;
+            },
+            tracker);
+    PubsubMessage message = PubsubMessage.newBuilder().setMessageId("message-id").build();
+    receiver.receiveMessage(message, mock(AckReplyConsumer.class));
+    receiver.receiveMessage(message, mock(AckReplyConsumer.class));
+
+    assertThat(subscriber.pullMessage().get()).isEqualTo(message);
+    assertThat(subscriber.pullMessage().isPresent()).isFalse();
+  }
+
+  @Test
+  public void redeliveryAfterSnapshot_doesNotReemitBeforeCheckpointCompletes() throws Throwable {
+    PubSubAckTracker tracker = new PubSubAckTracker();
+    PubSubNotifyingPullSubscriber subscriber =
+        new PubSubNotifyingPullSubscriber(
+            messageReceiver -> {
+              receiver = messageReceiver;
+              return mockSubscriber;
+            },
+            tracker);
+    PubsubMessage message = PubsubMessage.newBuilder().setMessageId("message-id").build();
+    receiver.receiveMessage(message, mock(AckReplyConsumer.class));
+    assertThat(subscriber.pullMessage().get()).isEqualTo(message);
+    tracker.stagePendingAck("message-id");
+    tracker.addCheckpoint(1L);
+    receiver.receiveMessage(message, mock(AckReplyConsumer.class));
+
+    assertThat(subscriber.pullMessage().isPresent()).isFalse();
   }
 
   @Test

@@ -20,6 +20,18 @@ import com.google.cloud.pubsub.v1.AckReplyConsumer;
 /** This class tracks the lifecycle of messages in {@link com.google.pubsub.flink.PubSubSource}. */
 public interface AckTracker {
   /**
+   * Track a delivery and return whether its message should be emitted.
+   *
+   * <p>Implementations may suppress redeliveries of a message still awaiting checkpoint
+   * acknowledgement, while retaining the newest delivery's acknowledgement handle. The default
+   * preserves the behavior of trackers that do not suppress redeliveries.
+   */
+  default boolean trackMessageDelivery(String messageId, AckReplyConsumer ackReplyConsumer) {
+    addPendingAck(messageId, ackReplyConsumer);
+    return true;
+  }
+
+  /**
    * Track a new pending ack. Acks are pending when a message has been received but not yet
    * processed by the Flink pipeline.
    *

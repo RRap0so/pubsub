@@ -20,19 +20,35 @@ import static org.junit.Assert.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 
+import com.google.api.gax.core.NoCredentialsProvider;
+import com.google.api.gax.grpc.GrpcTransportChannel;
+import com.google.api.gax.rpc.FixedTransportChannelProvider;
+import com.google.cloud.pubsub.v1.MessageReceiver;
+import com.google.cloud.pubsub.v1.Subscriber;
+import com.google.pubsub.flink.internal.source.reader.PubSubAckTracker;
+import com.google.pubsub.flink.internal.source.reader.PubSubNotifyingPullSubscriber;
+import com.google.pubsub.flink.internal.source.reader.PubSubSourceReader;
+import com.google.pubsub.flink.internal.source.reader.PubSubSplitReader;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
+import com.google.pubsub.v1.ProjectSubscriptionName;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.api.connector.source.SourceReaderContext;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.testutils.source.reader.TestingReaderOutput;
 import org.junit.After;
 import org.junit.Assume;
@@ -46,7 +62,7 @@ import org.junit.Test;
 public class PubSubCheckpointRecoveryEmulatorTest {
   private final HttpClient http = HttpClient.newHttpClient();
   private final List<SourceReader<String, SubscriptionSplit>> readers = new ArrayList<>();
-  private final List<io.grpc.ManagedChannel> channels = new ArrayList<>();
+  private final List<ManagedChannel> channels = new ArrayList<>();
   private String endpoint;
   private String topic;
   private String subscription;
@@ -172,56 +188,58 @@ public class PubSubCheckpointRecoveryEmulatorTest {
   }
 
   @Test(timeout = 40000)
-  public void expiredLease_redeliversAndEmitsDuplicateBeforeAnyCheckpointCompletes()
+  public void expiredLease_redeliversWithoutDuplicateEmissionBeforeCheckpointCompletes()
       throws Exception {
     // Use the real reader, emitter and StreamingPull subscriber, explicitly disabling leasing
     // to reproduce the legacy/no-extension failure without a production-scale workload.
-    var channel = io.grpc.ManagedChannelBuilder.forTarget(endpoint).usePlaintext().build();
+    var channel = ManagedChannelBuilder.forTarget(endpoint).usePlaintext().build();
     channels.add(channel);
     var channelProvider =
-        com.google.api.gax.rpc.FixedTransportChannelProvider.create(
-            com.google.api.gax.grpc.GrpcTransportChannel.create(channel));
-    var tracker = new com.google.pubsub.flink.internal.source.reader.PubSubAckTracker();
+        FixedTransportChannelProvider.create(GrpcTransportChannel.create(channel));
+    var tracker = new PubSubAckTracker();
+    var deliveries = new AtomicInteger();
     SourceReader<String, SubscriptionSplit> original =
-        new com.google.pubsub.flink.internal.source.reader.PubSubSourceReader<>(
+        new PubSubSourceReader<>(
             PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()),
             tracker,
             ackTracker ->
-                new com.google.pubsub.flink.internal.source.reader.PubSubSplitReader(
+                new PubSubSplitReader(
                     () ->
-                        new com.google.pubsub.flink.internal.source.reader
-                            .PubSubNotifyingPullSubscriber(
+                        new PubSubNotifyingPullSubscriber(
                             receiver ->
-                                com.google.cloud.pubsub.v1.Subscriber.newBuilder(
-                                        subscription, receiver)
+                                Subscriber.newBuilder(
+                                        subscription,
+                                        (MessageReceiver)
+                                            (message, consumer) -> {
+                                              receiver.receiveMessage(message, consumer);
+                                              deliveries.incrementAndGet();
+                                            })
                                     .setChannelProvider(channelProvider)
-                                    .setCredentialsProvider(
-                                        com.google.api.gax.core.NoCredentialsProvider.create())
+                                    .setCredentialsProvider(NoCredentialsProvider.create())
                                     .setMaxAckExtensionPeriod(org.threeten.bp.Duration.ZERO)
                                     .build(),
                             ackTracker)),
-            new org.apache.flink.configuration.Configuration(),
+            new Configuration(),
             mock(SourceReaderContext.class, RETURNS_DEEP_STUBS));
     readers.add(original);
     original.start();
     original.addSplits(
-        List.of(
-            SubscriptionSplit.create(
-                com.google.pubsub.v1.ProjectSubscriptionName.parse(subscription))));
+        List.of(SubscriptionSplit.create(ProjectSubscriptionName.parse(subscription))));
     TestingReaderOutput<String> output = new TestingReaderOutput<>();
     publish("A");
     long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-    while (output.getEmittedRecords().size() < 2 && System.nanoTime() < deadline) {
+    while (deliveries.get() < 2 && System.nanoTime() < deadline) {
       original.pollNext(output);
       Thread.sleep(10);
     }
-    assertTrue(
-        "No redelivery observed: " + output.getEmittedRecords(),
-        output.getEmittedRecords().size() >= 2);
-    assertEquals("A", output.getEmittedRecords().get(0));
-    assertEquals("A", output.getEmittedRecords().get(1));
-    original.snapshotState(1); // Both copies already emitted before the first checkpoint.
+    assertTrue("No service redelivery observed", deliveries.get() >= 2);
+    pollFor(original, output, Duration.ofMillis(200));
+    assertEquals(List.of("A"), output.getEmittedRecords());
+    original.snapshotState(1);
     original.notifyCheckpointComplete(1);
+    publish("B");
+    awaitCount(original, output, 2);
+    assertEquals(List.of("A", "B"), output.getEmittedRecords());
   }
 
   @Test(timeout = 30000)
@@ -260,9 +278,7 @@ public class PubSubCheckpointRecoveryEmulatorTest {
     reader.start();
     reader.addSplits(
         splits == null
-            ? List.of(
-                SubscriptionSplit.create(
-                    com.google.pubsub.v1.ProjectSubscriptionName.parse(subscription)))
+            ? List.of(SubscriptionSplit.create(ProjectSubscriptionName.parse(subscription)))
             : splits);
     return reader;
   }
@@ -290,8 +306,7 @@ public class PubSubCheckpointRecoveryEmulatorTest {
   }
 
   private void publish(String value) throws Exception {
-    String data =
-        Base64.getEncoder().encodeToString(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    String data = Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
     api("POST", topic + ":publish", "{\"messages\":[{\"data\":\"" + data + "\"}]}");
   }
 
@@ -311,8 +326,8 @@ public class PubSubCheckpointRecoveryEmulatorTest {
     for (SourceReader<String, SubscriptionSplit> reader : readers) {
       reader.close();
     }
-    for (io.grpc.ManagedChannel channel : channels) {
-      channel.shutdownNow().awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+    for (ManagedChannel channel : channels) {
+      channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
     }
     if (endpoint != null && subscription != null) {
       api("DELETE", subscription, "");

@@ -1,8 +1,9 @@
 # Checkpoint and replay reproductions
 
-These tests characterize the connector's existing recovery behavior. They add no
-connector behavior changes. A passing reproduction asserts the observed outcome,
-including missing input or duplicate state updates in the scenarios below.
+These tests characterize the connector's recovery behavior. A passing test asserts
+the documented outcome, including remaining missing-input and duplicate-state
+scenarios. In-flight redelivery within one reader is now suppressed until
+checkpoint acknowledgement, using the latest delivery's acknowledgement handle.
 
 ## Run locally
 
@@ -51,7 +52,7 @@ context. It does not run a Flink coordinator:
 | Restore an older checkpoint after a newer checkpoint acknowledges input | Later acknowledged work is not replayed; a newly published control record still arrives. |
 | Persist a checkpoint but lose the source's completion notification | Already checkpointed work is redelivered. |
 | Set the outstanding-message limit to one and delay checkpoint completion | Input stops after one message; taking a checkpoint alone does not release capacity; successful completion does. |
-| Disable automatic lease extension and delay checkpoint completion | The source emits the same message more than once before any checkpoint completes. |
+| Disable automatic lease extension and delay checkpoint completion | Pub/Sub redelivers the message, but the reader emits it once and acknowledges the latest delivery when the checkpoint completes. |
 | Keep automatic lease extension enabled while delaying a checkpoint beyond the subscription deadline | No duplicate is observed during the controlled delay. |
 
 All test resources use unique synthetic names and are removed during cleanup.
@@ -63,6 +64,10 @@ The emulator does not model production snapshot storage charges or configurable
 retention accurately. These tests do not measure billing, high-volume throughput,
 client lease-estimator convergence, or Kubernetes JobManager/HA behavior. They
 also do not establish exactly-once delivery or end-to-end sink semantics.
+
+In-flight suppression is local to each reader and is cleared after checkpoint
+acknowledgement or shutdown. It does not deduplicate across readers, restarts,
+snapshot seeks, or deliveries arriving after the checkpoint acknowledgement.
 
 The snapshot test deliberately demonstrates the acknowledgement-state mismatch;
 it does not introduce a snapshot-based recovery implementation.

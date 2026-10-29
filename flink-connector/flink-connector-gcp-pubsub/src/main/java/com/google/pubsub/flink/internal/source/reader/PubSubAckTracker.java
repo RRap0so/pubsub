@@ -19,31 +19,46 @@ import com.google.cloud.pubsub.v1.AckReplyConsumer;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 
 public class PubSubAckTracker implements AckTracker {
   @GuardedBy("this")
-  private final Map<String, AckReplyConsumer> pendingAcks = new HashMap<>();
+  private final Map<String, AckReplyConsumer> outstandingAcks = new HashMap<>();
 
   @GuardedBy("this")
-  private final List<AckReplyConsumer> stagedAcks = new ArrayList<>();
+  private final Set<String> pendingAcks = new HashSet<>();
 
   @GuardedBy("this")
-  private final SortedMap<Long, List<AckReplyConsumer>> checkpoints = new TreeMap<>();
+  private final List<String> stagedAcks = new ArrayList<>();
+
+  @GuardedBy("this")
+  private final SortedMap<Long, List<String>> checkpoints = new TreeMap<>();
+
+  @Override
+  public synchronized boolean trackMessageDelivery(
+      String messageId, AckReplyConsumer ackReplyConsumer) {
+    boolean firstDelivery = !outstandingAcks.containsKey(messageId);
+    outstandingAcks.put(messageId, ackReplyConsumer);
+    if (firstDelivery) {
+      pendingAcks.add(messageId);
+    }
+    return firstDelivery;
+  }
 
   @Override
   public synchronized void addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer) {
-    pendingAcks.put(messageId, ackReplyConsumer);
+    trackMessageDelivery(messageId, ackReplyConsumer);
   }
 
   @Override
   public synchronized void stagePendingAck(String messageId) {
-    AckReplyConsumer ackToStage = pendingAcks.remove(messageId);
-    if (ackToStage != null) {
-      stagedAcks.add(ackToStage);
+    if (pendingAcks.remove(messageId)) {
+      stagedAcks.add(messageId);
     }
   }
 
@@ -55,24 +70,19 @@ public class PubSubAckTracker implements AckTracker {
 
   @Override
   public synchronized void notifyCheckpointComplete(long checkpointId) {
-    List<AckReplyConsumer> toAck = new ArrayList<>();
+    List<String> toAck = new ArrayList<>();
     while (!checkpoints.isEmpty() && checkpoints.firstKey() <= checkpointId) {
       toAck.addAll(checkpoints.remove(checkpoints.firstKey()));
     }
-    toAck.forEach((ackReplyConsumer) -> ackReplyConsumer.ack());
+    toAck.forEach(messageId -> outstandingAcks.remove(messageId).ack());
   }
 
   @Override
   public synchronized void nackAll() {
-    pendingAcks.values().forEach((ackReplyConsumer) -> ackReplyConsumer.nack());
+    outstandingAcks.values().forEach((ackReplyConsumer) -> ackReplyConsumer.nack());
+    outstandingAcks.clear();
     pendingAcks.clear();
-    stagedAcks.forEach((ackReplyConsumer) -> ackReplyConsumer.nack());
     stagedAcks.clear();
-    checkpoints
-        .values()
-        .forEach(
-            (ackReplyConsumers) ->
-                ackReplyConsumers.forEach((ackReplyConsumer) -> ackReplyConsumer.nack()));
     checkpoints.clear();
   }
 }
