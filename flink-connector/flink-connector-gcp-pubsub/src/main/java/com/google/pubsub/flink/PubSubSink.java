@@ -101,26 +101,9 @@ public abstract class PubSubSink<T> implements Sink<T> {
       if (enableMessageOrdering().isPresent()) {
         builder.setEnableMessageOrdering(enableMessageOrdering().get());
       }
-      if (emulatorEndpoint != null) builder.setEndpoint(emulatorEndpoint);
-      else if (endpoint().isPresent()) builder.setEndpoint(endpoint().get());
       return new PubSubFlushablePublisher(builder.build(), transport, executor, callbackExecutor);
     } catch (IOException | RuntimeException | Error failure) {
-      try {
-        if (transport != null) transport.shutdownNow();
-      } catch (RuntimeException cleanupFailure) {
-        failure.addSuppressed(cleanupFailure);
-      } finally {
-        try {
-          if (callbackExecutor != null) callbackExecutor.shutdownNow();
-        } catch (RuntimeException cleanupFailure) {
-          failure.addSuppressed(cleanupFailure);
-        }
-        try {
-          executor.shutdownNow();
-        } catch (RuntimeException cleanupFailure) {
-          failure.addSuppressed(cleanupFailure);
-        }
-      }
+      PubSubFlushablePublisher.forceCloseResources(failure, transport, callbackExecutor, executor);
       throw failure;
     }
   }

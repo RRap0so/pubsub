@@ -157,6 +157,35 @@ public class PubSubSinkTest {
     verify(callbacks).shutdownNow();
   }
 
+  @Test
+  public void transportCreationFailurePreservesCauseWhenExecutorCleanupAlsoFails()
+      throws Exception {
+    var sink = spy(sinkBuilder().setEndpoint("emulator:///127.0.0.1:23456").build());
+    ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+    ScheduledExecutorService callbacks = mock(ScheduledExecutorService.class);
+    InstantiatingGrpcChannelProvider provider = mock(InstantiatingGrpcChannelProvider.class);
+    IOException failure = new IOException("Transport creation failed");
+    RuntimeException callbackFailure = new RuntimeException("Callback executor cleanup failed");
+    RuntimeException retryFailure = new RuntimeException("Retry executor cleanup failed");
+    doReturn(executor).when(sink).createExecutor();
+    doReturn(callbacks).when(sink).createCallbackExecutor();
+    doReturn(provider).when(sink).createChannelProvider(any());
+    when(provider.getTransportChannel()).thenThrow(failure);
+    doThrow(callbackFailure).when(callbacks).shutdownNow();
+    doThrow(retryFailure).when(executor).shutdownNow();
+
+    IOException actual =
+        assertThrows(IOException.class, () -> sink.createWriter(mock(WriterInitContext.class)));
+
+    assertThat(actual).isSameInstanceAs(failure);
+    assertThat(actual.getSuppressed())
+        .asList()
+        .containsExactly(callbackFailure, retryFailure)
+        .inOrder();
+    verify(executor).shutdownNow();
+    verify(callbacks).shutdownNow();
+  }
+
   private static PubSubSink.Builder<String> sinkBuilder() {
     return PubSubSink.<String>builder()
         .setProjectName("project")

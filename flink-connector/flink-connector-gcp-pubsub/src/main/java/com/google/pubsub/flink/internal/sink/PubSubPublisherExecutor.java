@@ -34,7 +34,9 @@ public class PubSubPublisherExecutor extends ScheduledThreadPoolExecutor {
   @Override
   protected <V> RunnableScheduledFuture<V> decorateTask(
       Runnable callback, RunnableScheduledFuture<V> scheduled) {
-    // GAX's listening scheduler wraps a callback Future in a different scheduled Future.
+    // Verified with google-cloud-pubsub 1.133.1 / GAX 2.55.0. This relies on GAX wrapping a
+    // callback Future in a different scheduled Future; keep PubSubPublisherShutdownIT running
+    // when updating either dependency, including its retry-backoff and ordered-publish cases.
     // Cancelling only the outer one leaves the publish result and SDK waiter unresolved.
     if (callback instanceof Future<?>) callbacks.put(scheduled, (Future<?>) callback);
     return scheduled;

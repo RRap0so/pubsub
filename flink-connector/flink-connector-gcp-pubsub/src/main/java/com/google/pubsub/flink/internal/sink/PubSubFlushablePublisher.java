@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -257,15 +258,25 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   }
 
   private void forceResources(Throwable failure) {
+    // Callback execution must survive until the SDK shutdown waiter drains. Construction failure,
+    // in contrast, can close both executors immediately because no publishes were handed off.
+    forceCloseResources(failure, transport, executor);
+  }
+
+  /** Aborts the supplied owned resources, preserving the primary failure and all cleanup errors. */
+  public static void forceCloseResources(
+      Throwable failure, TransportChannel transport, ExecutorService... executors) {
     try {
       if (transport != null) transport.shutdownNow();
     } catch (RuntimeException cleanupFailure) {
-      failure.addSuppressed(cleanupFailure);
+      if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
     } finally {
-      try {
-        if (executor != null) executor.shutdownNow();
-      } catch (RuntimeException cleanupFailure) {
-        failure.addSuppressed(cleanupFailure);
+      for (ExecutorService executor : executors) {
+        try {
+          if (executor != null) executor.shutdownNow();
+        } catch (RuntimeException cleanupFailure) {
+          if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+        }
       }
     }
   }
