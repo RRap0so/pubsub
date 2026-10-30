@@ -74,34 +74,32 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
       failure = new IOException("Unable to flush Pub/Sub publisher during close", failed);
     } finally {
       try {
-        // SDK shutdown itself drains pending requests. Bound the subsequent resource wait.
-        publisher.shutdown();
-        if (!publisher.awaitTermination(30, TimeUnit.SECONDS)) {
-          throw new IOException("Pub/Sub publisher did not terminate within 30 seconds");
-        }
-      } catch (InterruptedException interrupted) {
-        Thread.currentThread().interrupt();
-        IOException cleanup =
-            new IOException("Interrupted while closing Pub/Sub publisher", interrupted);
+        shutdownPublisher();
+      } catch (IOException cleanupFailure) {
         if (failure == null) {
-          failure = cleanup;
+          failure = cleanupFailure;
         } else {
-          failure.addSuppressed(cleanup);
-        }
-      } catch (IOException | RuntimeException failed) {
-        IOException cleanup =
-            failed instanceof IOException
-                ? (IOException) failed
-                : new IOException("Unable to shut down Pub/Sub publisher", failed);
-        if (failure == null) {
-          failure = cleanup;
-        } else {
-          failure.addSuppressed(cleanup);
+          failure.addSuppressed(cleanupFailure);
         }
       }
     }
     if (failure != null) {
       throw failure;
+    }
+  }
+
+  private void shutdownPublisher() throws IOException {
+    try {
+      // SDK shutdown itself drains pending requests. Bound the subsequent resource wait.
+      publisher.shutdown();
+      if (!publisher.awaitTermination(30, TimeUnit.SECONDS)) {
+        throw new IOException("Pub/Sub publisher did not terminate within 30 seconds");
+      }
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while closing Pub/Sub publisher", interrupted);
+    } catch (RuntimeException failure) {
+      throw new IOException("Unable to shut down Pub/Sub publisher", failure);
     }
   }
 }
