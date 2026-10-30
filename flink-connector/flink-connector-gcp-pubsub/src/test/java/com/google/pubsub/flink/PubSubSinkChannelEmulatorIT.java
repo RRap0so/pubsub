@@ -38,7 +38,6 @@ import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.junit.After;
-import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -56,13 +55,7 @@ public class PubSubSinkChannelEmulatorIT {
 
   @Before
   public void createTopic() throws Exception {
-    endpoint = System.getenv("CHECKPOINT_TEST_EMULATOR");
-    Assume.assumeNotNull(endpoint);
-    assertTrue(endpoint.matches("127\\.0\\.0\\.1:[0-9]+"));
-    String clientEndpoint = System.getenv("PUBSUB_EMULATOR_HOST");
-    assertTrue(
-        "PUBSUB_EMULATOR_HOST must match the test emulator",
-        clientEndpoint == null || clientEndpoint.equals(endpoint));
+    endpoint = PubSubEmulator.endpoint();
     topic = "projects/sink-channel-repro/topics/publisher-" + UUID.randomUUID();
     api("PUT", topic, "{}");
   }

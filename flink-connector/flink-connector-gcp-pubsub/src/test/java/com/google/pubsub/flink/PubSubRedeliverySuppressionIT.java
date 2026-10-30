@@ -42,8 +42,9 @@ import org.junit.Test;
  * Broker-boundary check that suppressed redeliveries keep every delivery handle until the
  * checkpoint, instead of NACKing superseded handles and triggering a redelivery loop.
  *
- * <p>Uses CHECKPOINT_TEST_EMULATOR when set; otherwise PUBSUB_SEEK_TEST_PROJECT must explicitly
- * select a disposable cloud project, using ADC. Emulator results do not establish cloud semantics.
+ * <p>Runs against the Pub/Sub emulator by default. Set PUBSUB_TEST_PROJECT to a disposable cloud
+ * project to run against the real service instead, using ADC. Emulator results do not establish
+ * cloud semantics.
  */
 public class PubSubRedeliverySuppressionIT {
   private final HttpClient http =
@@ -55,14 +56,12 @@ public class PubSubRedeliverySuppressionIT {
 
   @Before
   public void setUp() throws Exception {
-    emulator = System.getenv("CHECKPOINT_TEST_EMULATOR");
-    if (emulator != null) {
-      assertTrue(emulator.matches("127\\.0\\.0\\.1:[0-9]+"));
-      project = "checkpoint-repro";
+    project = System.getenv("PUBSUB_TEST_PROJECT");
+    if (project == null) {
+      emulator = PubSubEmulator.endpoint();
+      project = "redelivery-test";
       base = "http://" + emulator + "/v1/";
     } else {
-      project = System.getenv("PUBSUB_SEEK_TEST_PROJECT");
-      Assume.assumeNotNull(project);
       assertTrue(project.matches("[a-z][a-z0-9-]{4,61}[a-z0-9]"));
       base = "https://pubsub.googleapis.com/v1/";
       credentials =
