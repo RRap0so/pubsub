@@ -29,6 +29,7 @@ import com.google.pubsub.flink.util.EmulatorEndpoint;
 import com.google.pubsub.v1.ProjectSnapshotName;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.SeekRequest;
+import com.google.pubsub.v1.Snapshot;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import java.io.IOException;
@@ -73,6 +74,50 @@ public final class PubSubSnapshotStore implements PubSubReplaySnapshots.Store {
         channel.shutdownNow();
       }
       throw failure;
+    }
+  }
+
+  PubSubSnapshotStore(String project, String subscription, SubscriptionAdminClient client) {
+    this.project = project;
+    this.subscription = ProjectSubscriptionName.of(project, subscription);
+    this.client = client;
+    this.channel = null;
+  }
+
+  /** Lists only snapshots on the configured subscription's topic. Does not modify resources. */
+  public List<String> listForSubscriptionTopic() {
+    String topic = client.getSubscription(subscription).getTopic();
+    List<String> names = new ArrayList<>();
+    client
+        .listSnapshots("projects/" + project)
+        .iterateAll()
+        .forEach(
+            snapshot -> {
+              if (snapshot.getTopic().equals(topic)) {
+                names.add(snapshot.getName());
+              }
+            });
+    return names;
+  }
+
+  /** Validates the entire explicit deletion list before deleting any snapshot. */
+  public void deleteForSubscriptionTopic(List<String> names) {
+    List<ProjectSnapshotName> parsed = new ArrayList<>();
+    for (String name : names) {
+      parsed.add(snapshotName(name));
+    }
+    String topic = client.getSubscription(subscription).getTopic();
+    for (ProjectSnapshotName name : parsed) {
+      try {
+        Snapshot snapshot = client.getSnapshot(name);
+        Preconditions.checkArgument(
+            snapshot.getTopic().equals(topic), "Replay snapshot belongs to a different topic");
+      } catch (NotFoundException alreadyGone) {
+        // Expiration or a prior cleanup may already have removed this reviewed resource.
+      }
+    }
+    for (ProjectSnapshotName name : parsed) {
+      delete(name.toString());
     }
   }
 
