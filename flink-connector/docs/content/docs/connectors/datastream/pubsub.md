@@ -130,8 +130,26 @@ Checkpointing is required to use Pub/Sub source. When a checkpoint completes,
 all messages delivered before the last successful checkpoint are acknowledged to
 Google Cloud Pub/Sub. In case of failure, messages delivered after the last
 successful checkpoint are unacknowledged and will automatically be redelivered.
-Note that there is no message delivery state stored in checkpoints, so retained
-checkpoints are not necessary to resume using Pub/Sub source.
+By default, source checkpoints contain subscription assignments, not a rewindable
+input position. Restoring an older checkpoint does not rewind acknowledgements
+made by newer checkpoints, so input missing from the restored state can be lost.
+
+For at-least-once replay from retained checkpoints and savepoints, explicitly set
+`PubSubSource.<OutputT>builder().setReplaySnapshotRetentionCount(count)` with a
+positive count. The coordinator captures a Pub/Sub snapshot before the readers'
+checkpoint barriers and stores its reference in checkpoint state. Restore seeks
+to that snapshot before assigning readers. Missing or expired snapshots fail
+recovery rather than silently skipping input.
+
+This option is disabled by default and requires a dedicated subscription and
+snapshot administration permissions. It retains the last `count` snapshot
+boundaries at or before the newest completed checkpoint, plus in-flight ones.
+New boundaries fail once `count + 1` snapshots are tracked; use one concurrent
+checkpoint and complete checkpoints between manual savepoints.
+Older savepoints outside this window cannot be restored. Pub/Sub bills retained
+snapshot data separately; snapshots survive job shutdown and abandoned jobs
+require independent cleanup. Replay can duplicate records already represented
+in Flink state and does not provide exactly-once state semantics.
 
 ### StreamingPull Connections and Flow Control
 
@@ -258,6 +276,11 @@ redelivered by Google Cloud Pub/Sub.
         <td>setEndpoint(String endpoint)</td>
         <td>pubsub.googleapis.com:443</td>
         <td>The Google Cloud Pub/Sub gRPC endpoint from which messages are pulled. Defaults to the global endpoint, which routes requests to the nearest regional endpoint.</td>
+    </tr>
+    <tr>
+        <td>setReplaySnapshotRetentionCount(Integer count)</td>
+        <td>(disabled)</td>
+        <td>Enables checkpoint-coordinated replay snapshots. Retains the most recent count snapshot boundaries at or before the newest completed checkpoint, plus in-flight boundaries. Requires count &gt; 0, snapshot permissions, and a dedicated subscription. Snapshot storage is billed separately; replay remains at least once.</td>
     </tr>
   </tbody>
 </table>

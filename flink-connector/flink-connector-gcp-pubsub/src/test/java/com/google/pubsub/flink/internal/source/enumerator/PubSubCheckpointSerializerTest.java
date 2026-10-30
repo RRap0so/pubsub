@@ -16,6 +16,7 @@
 package com.google.pubsub.flink.internal.source.enumerator;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
 import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import java.util.ArrayList;
@@ -36,5 +37,22 @@ public final class PubSubCheckpointSerializerTest {
     PubSubCheckpointSerializer serializer = new PubSubCheckpointSerializer();
     assertThat(serializer.deserialize(serializer.getVersion(), serializer.serialize(proto)))
         .isEqualTo(proto);
+  }
+
+  @Test
+  public void deserialize_readsLegacyVersionZero() throws Exception {
+    PubSubEnumeratorCheckpoint checkpoint =
+        PubSubEnumeratorCheckpoint.newBuilder()
+            .addAssignments(PubSubEnumeratorCheckpoint.Assignment.newBuilder().setSubtask(1))
+            .build();
+    assertThat(new PubSubCheckpointSerializer().deserialize(0, checkpoint.toByteArray()))
+        .isEqualTo(checkpoint);
+  }
+
+  @Test
+  public void deserialize_rejectsUnknownVersion() {
+    assertThrows(
+        java.io.IOException.class,
+        () -> new PubSubCheckpointSerializer().deserialize(2, new byte[0]));
   }
 }

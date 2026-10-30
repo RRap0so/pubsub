@@ -18,6 +18,9 @@ package com.google.pubsub.flink;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.google.protobuf.util.JsonFormat;
+import com.google.pubsub.v1.ListSnapshotsResponse;
+import com.google.pubsub.v1.PullResponse;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -42,6 +45,7 @@ import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.execution.CheckpointType;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
@@ -129,6 +133,7 @@ public class PubSubRecoveryIT {
     publish("B");
     await(() -> "A,B".equals(COMPLETED.get(firstRun)), "newer checkpoint containing B");
     cancel(original);
+    assertSubscriptionDrained();
 
     String secondRun = runId();
     startJob(secondRun, oldSavepoint, true);
@@ -148,6 +153,60 @@ public class PubSubRecoveryIT {
     publish("B"); // Mapper deliberately fails once before changing B's managed state.
     await(() -> OUTPUT.get(run).contains("B|A,B"), "automatic recovery and B redelivery");
     assertEquals(false, FAIL_B_ONCE.get(run).get());
+  }
+
+  @Test(timeout = 90000)
+  public void replaySnapshots_restoreAcknowledgedInputFromOlderSavepoint() throws Exception {
+    verifyReplayRecovery(1);
+  }
+
+  @Test(timeout = 90000)
+  public void replaySnapshots_restoreAcknowledgedInputWithParallelReaders() throws Exception {
+    verifyReplayRecovery(2);
+  }
+
+  private void verifyReplayRecovery(int parallelism) throws Exception {
+    String firstRun = runId();
+    JobClient original = startJob(firstRun, null, false, 2, parallelism);
+    publish("A");
+    await(
+        () -> OUTPUT.get(firstRun).stream().anyMatch(value -> value.startsWith("A|")),
+        "A processed");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    String oldSavepoint =
+        original
+            .triggerSavepoint(savepointDir(), SavepointFormatType.CANONICAL)
+            .get(20, TimeUnit.SECONDS);
+    publish("B");
+    await(
+        () -> OUTPUT.get(firstRun).stream().anyMatch(value -> value.startsWith("B|")),
+        "B processed");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cancel(original); // Flush acknowledgements: B must now require explicit replay.
+    assertSubscriptionDrained();
+
+    String secondRun = runId();
+    startJob(secondRun, oldSavepoint, false, 2, parallelism);
+    publish("C");
+    await(
+        () -> OUTPUT.get(secondRun).stream().anyMatch(value -> value.startsWith("B|")),
+        "previously acknowledged B recovered from the older savepoint");
+    await(
+        () -> OUTPUT.get(secondRun).stream().anyMatch(value -> value.startsWith("C|")),
+        "C processed");
+    if (parallelism == 1) {
+      String last = OUTPUT.get(secondRun).get(OUTPUT.get(secondRun).size() - 1);
+      assertTrue(
+          last,
+          java.util.Arrays.asList(last.split("\\|", 2)[1].split(","))
+              .containsAll(List.of("A", "B", "C")));
+    }
   }
 
   @Test(timeout = 90000)
@@ -174,6 +233,12 @@ public class PubSubRecoveryIT {
   }
 
   private JobClient startJob(String run, String savepoint, boolean checkpointing) throws Exception {
+    return startJob(run, savepoint, checkpointing, 0, 1);
+  }
+
+  private JobClient startJob(
+      String run, String savepoint, boolean checkpointing, int replayRetention, int parallelism)
+      throws Exception {
     Configuration config = new Configuration();
     config.setString("restart-strategy.type", "fixed-delay");
     config.setString("restart-strategy.fixed-delay.attempts", "3");
@@ -182,8 +247,8 @@ public class PubSubRecoveryIT {
       config.setString("execution.savepoint.path", savepoint);
     }
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(config);
-    env.setParallelism(1);
-    env.setMaxParallelism(1);
+    env.setParallelism(parallelism);
+    env.setMaxParallelism(parallelism);
     if (checkpointing) {
       env.enableCheckpointing(200);
     } else {
@@ -191,16 +256,17 @@ public class PubSubRecoveryIT {
       env.enableCheckpointing(600000);
     }
     env.getCheckpointConfig().setCheckpointTimeout(20000);
-    env.fromSource(
-            PubSubSource.<String>builder()
-                .setProjectName("checkpoint-repro")
-                .setSubscriptionName("pubsub-" + suffix)
-                .setEndpoint("emulator:///" + endpoint)
-                .setDeserializationSchema(
-                    PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()))
-                .build(),
-            WatermarkStrategy.noWatermarks(),
-            "pubsub")
+    PubSubSource.Builder<String> source =
+        PubSubSource.<String>builder()
+            .setProjectName("checkpoint-repro")
+            .setSubscriptionName("pubsub-" + suffix)
+            .setEndpoint("emulator:///" + endpoint)
+            .setDeserializationSchema(
+                PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()));
+    if (replayRetention > 0) {
+      source.setReplaySnapshotRetentionCount(replayRetention);
+    }
+    env.fromSource(source.build(), WatermarkStrategy.noWatermarks(), "pubsub")
         .uid("pubsub")
         .map(new SessionAccumulator(run))
         .uid("session-state")
@@ -276,6 +342,16 @@ public class PubSubRecoveryIT {
 
   private void cancel(JobClient job) throws Exception {
     job.cancel().get(20, TimeUnit.SECONDS);
+    long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+    boolean terminated = false;
+    while (System.nanoTime() < deadline) {
+      if (job.getJobStatus().get(5, TimeUnit.SECONDS).isGloballyTerminalState()) {
+        terminated = true;
+        break;
+      }
+      Thread.sleep(20);
+    }
+    assertTrue("Old job must terminate before subscription replay", terminated);
     jobs.remove(job);
   }
 
@@ -294,7 +370,19 @@ public class PubSubRecoveryIT {
     api("POST", topic + ":publish", "{\"messages\":[{\"data\":\"" + data + "\"}]}");
   }
 
-  private void api(String method, String path, String body) throws Exception {
+  private void assertSubscriptionDrained() throws Exception {
+    PullResponse.Builder response = PullResponse.newBuilder();
+    JsonFormat.parser()
+        .merge(
+            api("POST", subscription + ":pull", "{\"maxMessages\":100,\"returnImmediately\":true}"),
+            response);
+    assertEquals(
+        "Input must already be acknowledged before exercising replay",
+        List.of(),
+        response.getReceivedMessagesList());
+  }
+
+  private String api(String method, String path, String body) throws Exception {
     HttpRequest request =
         HttpRequest.newBuilder(URI.create("http://" + endpoint + "/v1/" + path))
             .timeout(Duration.ofSeconds(5))
@@ -303,6 +391,7 @@ public class PubSubRecoveryIT {
             .build();
     HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
     assertTrue(response.body(), response.statusCode() >= 200 && response.statusCode() < 300);
+    return response.body();
   }
 
   @After
@@ -314,6 +403,13 @@ public class PubSubRecoveryIT {
       api("DELETE", snapshot, "");
     }
     if (subscription != null) {
+      var owned = ListSnapshotsResponse.newBuilder();
+      JsonFormat.parser().merge(api("GET", "projects/checkpoint-repro/snapshots", ""), owned);
+      for (var snapshot : owned.getSnapshotsList()) {
+        if (snapshot.getTopic().equals(topic)) {
+          api("DELETE", snapshot.getName(), "");
+        }
+      }
       api("DELETE", subscription, "");
       api("DELETE", topic, "");
     }

@@ -29,6 +29,8 @@ import com.google.cloud.pubsub.v1.SubscriptionAdminSettings;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.pubsub.flink.internal.source.enumerator.PubSubCheckpointSerializer;
+import com.google.pubsub.flink.internal.source.enumerator.PubSubReplaySnapshots;
+import com.google.pubsub.flink.internal.source.enumerator.PubSubSnapshotStore;
 import com.google.pubsub.flink.internal.source.enumerator.PubSubSplitEnumerator;
 import com.google.pubsub.flink.internal.source.reader.AckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubAckTracker;
@@ -42,7 +44,10 @@ import com.google.pubsub.flink.util.EmulatorEndpoint;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.PubsubMessage;
 import io.grpc.ManagedChannelBuilder;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.HashMap;
+import java.util.UUID;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.Boundedness;
@@ -85,8 +90,13 @@ public abstract class PubSubSource<OutputT>
 
   public abstract Optional<String> endpoint();
 
+  public abstract Optional<Integer> replaySnapshotRetentionCount();
+
+  abstract String replaySnapshotNamespace();
+
   public static <OutputT> Builder<OutputT> builder() {
-    return new AutoValue_PubSubSource.Builder<OutputT>();
+    return new AutoValue_PubSubSource.Builder<OutputT>()
+        .setReplaySnapshotNamespace(UUID.randomUUID().toString().replace("-", ""));
   }
 
   Subscriber createSubscriber(MessageReceiver receiver) {
@@ -170,19 +180,58 @@ public abstract class PubSubSource<OutputT>
     return new PubSubSplitEnumerator(
         ProjectSubscriptionName.of(projectName(), subscriptionName()),
         enumContext,
-        new HashMap<Integer, SubscriptionSplit>());
+        new HashMap<Integer, SubscriptionSplit>(),
+        createReplaySnapshots(null));
   }
 
   @Override
   public SplitEnumerator<SubscriptionSplit, PubSubEnumeratorCheckpoint> restoreEnumerator(
       SplitEnumeratorContext<SubscriptionSplit> enumContext,
       PubSubEnumeratorCheckpoint checkpoint) {
+    Preconditions.checkState(
+        replaySnapshotRetentionCount().isPresent()
+            || checkpoint.getReplaySnapshotNamespace().isEmpty(),
+        "Enable replay snapshot recovery to restore this checkpoint");
+    Preconditions.checkState(
+        !replaySnapshotRetentionCount().isPresent()
+            || !checkpoint.getReplaySnapshotNamespace().isEmpty(),
+        "This checkpoint has no replay snapshot; acknowledged input cannot be recovered safely");
+    Preconditions.checkArgument(
+        checkpoint.getReplaySnapshotNamespace().isEmpty()
+            || checkpoint
+                .getReplaySubscription()
+                .equals(ProjectSubscriptionName.of(projectName(), subscriptionName()).toString()),
+        "Replay checkpoint belongs to a different subscription");
     HashMap<Integer, SubscriptionSplit> assignments = new HashMap<>();
     for (PubSubEnumeratorCheckpoint.Assignment assignment : checkpoint.getAssignmentsList()) {
       assignments.put(assignment.getSubtask(), SubscriptionSplit.fromProto(assignment.getSplit()));
     }
     return new PubSubSplitEnumerator(
-        ProjectSubscriptionName.of(projectName(), subscriptionName()), enumContext, assignments);
+        ProjectSubscriptionName.of(projectName(), subscriptionName()),
+        enumContext,
+        assignments,
+        createReplaySnapshots(checkpoint));
+  }
+
+  private PubSubReplaySnapshots createReplaySnapshots(PubSubEnumeratorCheckpoint checkpoint) {
+    if (!replaySnapshotRetentionCount().isPresent()) {
+      return null;
+    }
+    PubSubSnapshotStore store;
+    try {
+      store = new PubSubSnapshotStore(projectName(), subscriptionName(), credentials(), endpoint());
+    } catch (IOException failure) {
+      throw new UncheckedIOException("Unable to open the replay snapshot client", failure);
+    }
+    try {
+      return checkpoint == null
+          ? PubSubReplaySnapshots.startFresh(
+              store, replaySnapshotRetentionCount().get(), replaySnapshotNamespace())
+          : PubSubReplaySnapshots.restore(store, replaySnapshotRetentionCount().get(), checkpoint);
+    } catch (RuntimeException failure) {
+      store.close();
+      throw failure;
+    }
   }
 
   @Override
@@ -271,6 +320,23 @@ public abstract class PubSubSource<OutputT>
      */
     public abstract Builder<OutputT> setEndpoint(String endpoint);
 
+    /**
+     * Enables checkpoint-coordinated Pub/Sub snapshots and retains the last {@code count} snapshot
+     * boundaries at or before the newest completed checkpoint, plus in-flight boundaries. Total
+     * tracked boundaries are capped at {@code count + 1}; use one concurrent checkpoint.
+     *
+     * <p>Disabled by default. Requires a dedicated subscription and snapshot create, delete, list,
+     * and seek permissions. Snapshot storage is billed separately. Older or expired snapshots
+     * cannot be restored; recovery fails rather than silently skipping acknowledged input.
+     *
+     * <p>Replay provides at-least-once input recovery and can duplicate records already in the
+     * restored state. Snapshots remain after job shutdown for recovery and expire under Pub/Sub's
+     * retention policy. Cleanup of abandoned jobs must be managed separately.
+     */
+    public abstract Builder<OutputT> setReplaySnapshotRetentionCount(Integer count);
+
+    abstract Builder<OutputT> setReplaySnapshotNamespace(String namespace);
+
     abstract PubSubSource<OutputT> autoBuild();
 
     public final PubSubSource<OutputT> build() {
@@ -284,6 +350,9 @@ public abstract class PubSubSource<OutputT>
       Preconditions.checkArgument(
           source.parallelPullCount().or(1) > 0,
           "parallelPullCount, if set, must be a value greater than 0.");
+      Preconditions.checkArgument(
+          source.replaySnapshotRetentionCount().or(1) > 0,
+          "replaySnapshotRetentionCount, if set, must be a value greater than 0.");
       return source;
     }
   }

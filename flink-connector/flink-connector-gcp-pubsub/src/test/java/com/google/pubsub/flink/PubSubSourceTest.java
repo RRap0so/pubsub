@@ -15,6 +15,7 @@
  */
 package com.google.pubsub.flink;
 
+import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
@@ -125,5 +126,75 @@ public class PubSubSourceTest {
   public void build_invalidEndpoint() throws Exception {
     assertThrows(
         NullPointerException.class, () -> PubSubSource.<String>builder().setEndpoint(null));
+  }
+
+  @Test
+  public void build_replaySnapshotsDisabledByDefault() {
+    assertThat(replayBuilder().build().replaySnapshotRetentionCount().isPresent()).isFalse();
+  }
+
+  @Test
+  public void build_replaySnapshotRetentionMustBePositive() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> replayBuilder().setReplaySnapshotRetentionCount(0).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> replayBuilder().setReplaySnapshotRetentionCount(-1).build());
+  }
+
+  @Test
+  public void restore_legacyCheckpointCannotEnableReplayRetroactively() {
+    PubSubSource<String> source = replayBuilder().setReplaySnapshotRetentionCount(2).build();
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            source.restoreEnumerator(
+                null,
+                com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint.getDefaultInstance()));
+  }
+
+  @Test
+  public void restore_replayCheckpointRequiresReplayConfiguration() {
+    PubSubSource<String> source = replayBuilder().build();
+    var checkpoint =
+        com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint.newBuilder()
+            .setReplaySnapshotNamespace("00000000000000000000000000000000")
+            .build();
+    assertThrows(IllegalStateException.class, () -> source.restoreEnumerator(null, checkpoint));
+  }
+
+  @Test
+  public void restore_replayCheckpointMustMatchConfiguredSubscription() {
+    PubSubSource<String> source = replayBuilder().setReplaySnapshotRetentionCount(2).build();
+    var checkpoint =
+        com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint.newBuilder()
+            .setReplaySnapshotNamespace("00000000000000000000000000000000")
+            .setReplaySubscription("projects/project/subscriptions/another-subscription")
+            .build();
+    assertThrows(IllegalArgumentException.class, () -> source.restoreEnumerator(null, checkpoint));
+  }
+
+  @Test
+  public void restore_legacyCheckpointWorksWithReplayDisabled() throws Exception {
+    PubSubSource<String> source = replayBuilder().build();
+    var checkpoint =
+        com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint.newBuilder()
+            .addAssignments(
+                com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint.Assignment.newBuilder()
+                    .setSubtask(0)
+                    .setSplit(
+                        com.google.pubsub.flink.proto.SubscriptionSplitProto.newBuilder()
+                            .setSubscription("projects/project/subscriptions/subscription")
+                            .setUid("0")))
+            .build();
+    assertThat(source.restoreEnumerator(null, checkpoint).snapshotState(2)).isEqualTo(checkpoint);
+  }
+
+  private PubSubSource.Builder<String> replayBuilder() {
+    return PubSubSource.<String>builder()
+        .setProjectName("project")
+        .setSubscriptionName("subscription")
+        .setDeserializationSchema(PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()));
   }
 }

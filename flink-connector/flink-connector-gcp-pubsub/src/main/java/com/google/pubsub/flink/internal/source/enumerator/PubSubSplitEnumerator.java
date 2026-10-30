@@ -37,14 +37,24 @@ public class PubSubSplitEnumerator
   private final ProjectSubscriptionName subscriptionName;
   private final SplitEnumeratorContext<SubscriptionSplit> context;
   private final HashMap<Integer, SubscriptionSplit> readersWithAssignments;
+  @Nullable private final PubSubReplaySnapshots replaySnapshots;
 
   public PubSubSplitEnumerator(
       ProjectSubscriptionName subscriptionName,
       SplitEnumeratorContext<SubscriptionSplit> context,
       HashMap<Integer, SubscriptionSplit> readersWithAssignments) {
+    this(subscriptionName, context, readersWithAssignments, null);
+  }
+
+  public PubSubSplitEnumerator(
+      ProjectSubscriptionName subscriptionName,
+      SplitEnumeratorContext<SubscriptionSplit> context,
+      HashMap<Integer, SubscriptionSplit> readersWithAssignments,
+      @Nullable PubSubReplaySnapshots replaySnapshots) {
     this.subscriptionName = subscriptionName;
     this.context = context;
     this.readersWithAssignments = readersWithAssignments;
+    this.replaySnapshots = replaySnapshots;
   }
 
   @Override
@@ -76,11 +86,37 @@ public class PubSubSplitEnumerator
                   .setSubtask(task)
                   .build());
         });
-    return PubSubEnumeratorCheckpoint.newBuilder().addAllAssignments(assignments).build();
+    PubSubEnumeratorCheckpoint.Builder checkpoint =
+        PubSubEnumeratorCheckpoint.newBuilder().addAllAssignments(assignments);
+    if (replaySnapshots != null) {
+      checkpoint.setReplaySubscription(subscriptionName.toString());
+      // Flink checkpoints coordinators before triggering task barriers. Create the shared
+      // subscription snapshot here, before any reader's checkpoint cut, rather than in one reader.
+      replaySnapshots.snapshot(checkpointId, checkpoint);
+    }
+    return checkpoint.build();
   }
 
   @Override
-  public void close() {}
+  public void notifyCheckpointComplete(long checkpointId) {
+    if (replaySnapshots != null) {
+      replaySnapshots.notifyCheckpointComplete(checkpointId);
+    }
+  }
+
+  @Override
+  public void notifyCheckpointAborted(long checkpointId) {
+    if (replaySnapshots != null) {
+      replaySnapshots.notifyCheckpointAborted(checkpointId);
+    }
+  }
+
+  @Override
+  public void close() {
+    if (replaySnapshots != null) {
+      replaySnapshots.close();
+    }
+  }
 
   private void checkForUnassignedReaders() {
     // Remove all assignments for readers that are no longer registered.

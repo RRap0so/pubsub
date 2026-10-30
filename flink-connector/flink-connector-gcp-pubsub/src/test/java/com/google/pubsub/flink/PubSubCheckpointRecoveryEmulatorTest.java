@@ -16,6 +16,7 @@
 package com.google.pubsub.flink;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
@@ -256,6 +257,38 @@ public class PubSubCheckpointRecoveryEmulatorTest {
     publish("B");
     awaitCount(original, output, 2);
     assertEquals(List.of("A", "B"), output.getEmittedRecords());
+  }
+
+  @Test(timeout = 15000)
+  public void replaySnapshotRestore_missingSnapshotFailsBeforeReadersStart() {
+    source =
+        PubSubSource.<String>builder()
+            .setProjectName("checkpoint-repro")
+            .setSubscriptionName(subscription.substring(subscription.lastIndexOf('/') + 1))
+            .setEndpoint("emulator:///" + endpoint)
+            .setReplaySnapshotRetentionCount(2)
+            .setDeserializationSchema(
+                PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()))
+            .build();
+    String namespace = UUID.randomUUID().toString().replace("-", "");
+    String missingName =
+        "projects/checkpoint-repro/snapshots/flink-"
+            + namespace
+            + "-"
+            + UUID.randomUUID().toString().replace("-", "");
+    var checkpoint =
+        com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint.newBuilder()
+            .setReplaySnapshotNamespace(namespace)
+            .setReplayCheckpointId(1)
+            .setReplaySubscription(subscription)
+            .addReplaySnapshots(
+                com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint.ReplaySnapshot.newBuilder()
+                    .setCheckpointId(1)
+                    .setName(missingName))
+            .build();
+    assertThrows(
+        com.google.api.gax.rpc.NotFoundException.class,
+        () -> source.restoreEnumerator(null, checkpoint));
   }
 
   private void pollFor(
