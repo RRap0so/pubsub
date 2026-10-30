@@ -18,12 +18,12 @@ package com.google.pubsub.flink;
 import com.google.api.gax.batching.FlowControlSettings;
 import com.google.api.gax.core.FixedCredentialsProvider;
 import com.google.api.gax.core.NoCredentialsProvider;
-import com.google.api.gax.grpc.GrpcTransportChannel;
+import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import com.google.api.gax.rpc.FixedHeaderProvider;
-import com.google.api.gax.rpc.FixedTransportChannelProvider;
 import com.google.auth.Credentials;
 import com.google.auto.value.AutoValue;
 import com.google.cloud.pubsub.v1.MessageReceiver;
+import com.google.cloud.pubsub.v1.MessageReceiverWithAckResponse;
 import com.google.cloud.pubsub.v1.Subscriber;
 import com.google.cloud.pubsub.v1.SubscriptionAdminSettings;
 import com.google.common.base.Optional;
@@ -33,6 +33,7 @@ import com.google.pubsub.flink.internal.source.enumerator.PubSubSplitEnumerator;
 import com.google.pubsub.flink.internal.source.reader.AckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubAckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubNotifyingPullSubscriber;
+import com.google.pubsub.flink.internal.source.reader.PubSubReaderMetrics;
 import com.google.pubsub.flink.internal.source.reader.PubSubSourceReader;
 import com.google.pubsub.flink.internal.source.reader.PubSubSplitReader;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
@@ -41,7 +42,6 @@ import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import com.google.pubsub.flink.util.EmulatorEndpoint;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.PubsubMessage;
-import io.grpc.ManagedChannelBuilder;
 import java.util.HashMap;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -55,6 +55,7 @@ import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.util.UserCodeClassLoader;
 import org.threeten.bp.Duration;
 
@@ -90,19 +91,16 @@ public abstract class PubSubSource<OutputT>
   }
 
   Subscriber createSubscriber(MessageReceiver receiver) {
+    return createSubscriber(receiver, new PubSubReaderMetrics(new UnregisteredMetricsGroup()));
+  }
+
+  Subscriber createSubscriber(MessageReceiver receiver, PubSubReaderMetrics metrics) {
+    MessageReceiverWithAckResponse observedReceiver =
+        (message, consumer) -> receiver.receiveMessage(message, metrics.observe(consumer));
     Subscriber.Builder builder =
         Subscriber.newBuilder(
-            ProjectSubscriptionName.of(projectName(), subscriptionName()).toString(), receiver);
-    // Channel settings copied from com.google.cloud:google-cloud-pubsub:1.124.1.
-    builder.setChannelProvider(
-        SubscriptionAdminSettings.defaultGrpcTransportProviderBuilder()
-            .setMaxInboundMessageSize(20 * 1024 * 1024) // 20MB API maximum message size.
-            .setMaxInboundMetadataSize(4 * 1024 * 1024) // 4MB API maximum metadata size)
-            .setKeepAliveTime(Duration.ofMinutes(5))
-            .setHeaderProvider(
-                FixedHeaderProvider.create(
-                    "x-goog-api-client", "PubSub-Flink-Connector/1.0.1-SNAPSHOT"))
-            .build());
+            ProjectSubscriptionName.of(projectName(), subscriptionName()).toString(),
+            observedReceiver);
     builder.setFlowControlSettings(
         FlowControlSettings.newBuilder()
             .setMaxOutstandingElementCount(maxOutstandingMessagesCount().or(1000L))
@@ -122,17 +120,35 @@ public abstract class PubSubSource<OutputT>
     String emulatorEndpoint = EmulatorEndpoint.getEmulatorEndpoint(endpoint());
     if (emulatorEndpoint != null) {
       builder.setCredentialsProvider(NoCredentialsProvider.create());
-      builder.setChannelProvider(
-          FixedTransportChannelProvider.create(
-              GrpcTransportChannel.create(
-                  ManagedChannelBuilder.forTarget(emulatorEndpoint).usePlaintext().build())));
+      builder.setEndpoint(emulatorEndpoint);
     }
+    builder.setChannelProvider(createChannelProvider(emulatorEndpoint));
     return builder.build();
   }
 
-  private PubSubSplitReader createSplitReader(AckTracker ackTracker) {
+  InstantiatingGrpcChannelProvider createChannelProvider(String emulatorEndpoint) {
+    // Let the SDK create and own channels so stop/failure also closes emulator transports.
+    InstantiatingGrpcChannelProvider.Builder provider =
+        SubscriptionAdminSettings.defaultGrpcTransportProviderBuilder()
+            .setMaxInboundMessageSize(20 * 1024 * 1024)
+            .setMaxInboundMetadataSize(4 * 1024 * 1024)
+            .setKeepAliveTime(Duration.ofMinutes(5))
+            .setHeaderProvider(
+                FixedHeaderProvider.create(
+                    "x-goog-api-client", "PubSub-Flink-Connector/1.0.1-SNAPSHOT"));
+    if (emulatorEndpoint != null) {
+      provider
+          .setEndpoint(emulatorEndpoint)
+          .setChannelConfigurator(channel -> channel.usePlaintext());
+    }
+    return provider.build();
+  }
+
+  private PubSubSplitReader createSplitReader(AckTracker ackTracker, PubSubReaderMetrics metrics) {
     return new PubSubSplitReader(
-        () -> new PubSubNotifyingPullSubscriber(this::createSubscriber, ackTracker));
+        () ->
+            new PubSubNotifyingPullSubscriber(
+                receiver -> createSubscriber(receiver, metrics), ackTracker));
   }
 
   @Override
@@ -156,10 +172,12 @@ public abstract class PubSubSource<OutputT>
             return null;
           }
         });
+    MetricGroup metrics = readerContext.metricGroup().addGroup("pubsub");
+    PubSubReaderMetrics acknowledgementMetrics = new PubSubReaderMetrics(metrics);
     return new PubSubSourceReader<>(
         schema,
-        new PubSubAckTracker(),
-        this::createSplitReader,
+        new PubSubAckTracker(metrics),
+        ackTracker -> createSplitReader(ackTracker, acknowledgementMetrics),
         new Configuration(),
         readerContext);
   }
