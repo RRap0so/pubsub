@@ -17,7 +17,6 @@ package com.google.pubsub.flink.internal.source.reader;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -41,7 +40,7 @@ public class PubSubAckTrackerTest {
   }
 
   @Test
-  public void suppressedRedelivery_resolvesOldHandleAndRetainsLatestUntilCheckpoint() {
+  public void suppressedRedelivery_retainsEveryHandleUntilCheckpoint() {
     AckReplyConsumer original = mock(AckReplyConsumer.class);
     AckReplyConsumer latest = mock(AckReplyConsumer.class);
     assertThat(ackTracker.trackMessageDelivery("message-id", original)).isTrue();
@@ -50,44 +49,42 @@ public class PubSubAckTrackerTest {
 
     assertThat(ackTracker.trackMessageDelivery("message-id", latest)).isFalse();
 
-    verify(original).nack();
+    verify(original, never()).nack();
     verify(original, never()).ack();
     verify(latest, never()).ack();
     verify(latest, never()).nack();
     ackTracker.notifyCheckpointComplete(1L);
     ackTracker.nackAll();
-    verify(original, times(1)).nack();
+    verify(original).ack();
+    verify(original, never()).nack();
     verify(latest).ack();
     verify(latest, never()).nack();
   }
 
   @Test
-  public void suppressedRedelivery_resolvesOldHandleOutsideTrackerLockThroughBothEntryPoints() {
+  public void bothEntryPoints_retainSupersededHandlesUntilShutdown() {
     for (boolean legacyEntryPoint : new boolean[] {false, true}) {
       PubSubAckTracker tracker = new PubSubAckTracker();
       AckReplyConsumer original = mock(AckReplyConsumer.class);
       AckReplyConsumer latest = mock(AckReplyConsumer.class);
-      doAnswer(
-              invocation -> {
-                assertThat(Thread.holdsLock(tracker)).isFalse();
-                return null;
-              })
-          .when(original)
-          .nack();
       tracker.trackMessageDelivery("message-id", original);
-
       if (legacyEntryPoint) {
         tracker.addPendingAck("message-id", latest);
       } else {
         assertThat(tracker.trackMessageDelivery("message-id", latest)).isFalse();
       }
-
+      verify(original, never()).ack();
+      verify(original, never()).nack();
+      verify(latest, never()).ack();
+      verify(latest, never()).nack();
+      tracker.nackAll();
       verify(original).nack();
+      verify(latest).nack();
     }
   }
 
   @Test
-  public void redeliveryBurst_leavesOnlyLatestHandleUnresolved() {
+  public void redeliveryBurst_retainsHandlesWithoutNackingAndResolvesAllAtCheckpoint() {
     AtomicInteger outstandingHandles = new AtomicInteger();
     AtomicInteger acknowledgements = new AtomicInteger();
     AtomicInteger negativeAcknowledgements = new AtomicInteger();
@@ -116,17 +113,17 @@ public class PubSubAckTrackerTest {
             }
           };
       assertThat(ackTracker.trackMessageDelivery("message-id", consumer)).isEqualTo(delivery == 0);
-      assertThat(outstandingHandles.get()).isEqualTo(1);
+      assertThat(outstandingHandles.get()).isEqualTo(delivery + 1);
       assertThat(acknowledgements.get()).isEqualTo(0);
     }
-    assertThat(negativeAcknowledgements.get()).isEqualTo(1999);
+    assertThat(negativeAcknowledgements.get()).isEqualTo(0);
     ackTracker.stagePendingAck("message-id");
     ackTracker.addCheckpoint(1L);
     ackTracker.notifyCheckpointComplete(1L);
     ackTracker.nackAll();
     assertThat(outstandingHandles.get()).isEqualTo(0);
-    assertThat(acknowledgements.get()).isEqualTo(1);
-    assertThat(negativeAcknowledgements.get()).isEqualTo(1999);
+    assertThat(acknowledgements.get()).isEqualTo(2000);
+    assertThat(negativeAcknowledgements.get()).isEqualTo(0);
   }
 
   @Test
@@ -139,6 +136,78 @@ public class PubSubAckTrackerTest {
     ackTracker.addCheckpoint(1L);
     ackTracker.notifyCheckpointComplete(1L);
     verify(consumer).ack();
+  }
+
+  @Test
+  public void reusedSupersededHandle_isResolvedOnlyOnce() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer other = mock(AckReplyConsumer.class);
+    ackTracker.trackMessageDelivery("message-id", original);
+    ackTracker.trackMessageDelivery("message-id", other);
+    ackTracker.trackMessageDelivery("message-id", original);
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addCheckpoint(1);
+    ackTracker.notifyCheckpointComplete(1);
+    ackTracker.nackAll();
+    verify(original).ack();
+    verify(other).ack();
+    verify(original, never()).nack();
+    verify(other, never()).nack();
+  }
+
+  @Test
+  public void supersededAckFailure_doesNotRetrySuccessfullyResolvedHandle() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer latest = mock(AckReplyConsumer.class);
+    doThrow(new IllegalStateException("Injected superseded-handle failure"))
+        .doNothing()
+        .when(original)
+        .ack();
+    ackTracker.trackMessageDelivery("message-id", original);
+    ackTracker.trackMessageDelivery("message-id", latest);
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addCheckpoint(1);
+    assertThrows(IllegalStateException.class, () -> ackTracker.notifyCheckpointComplete(1));
+    ackTracker.notifyCheckpointComplete(1);
+    ackTracker.nackAll();
+    verify(latest).ack();
+    verify(original, times(2)).ack();
+    verify(latest, never()).nack();
+    verify(original, never()).nack();
+  }
+
+  @Test
+  public void supersededAckFailure_keepsOnlyUnresolvedHandleForShutdown() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer latest = mock(AckReplyConsumer.class);
+    doThrow(new IllegalStateException("Injected superseded-handle failure")).when(original).ack();
+    ackTracker.trackMessageDelivery("message-id", original);
+    ackTracker.trackMessageDelivery("message-id", latest);
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addCheckpoint(1);
+    assertThrows(IllegalStateException.class, () -> ackTracker.notifyCheckpointComplete(1));
+    ackTracker.nackAll();
+    verify(latest).ack();
+    verify(latest, never()).nack();
+    verify(original).nack();
+  }
+
+  @Test
+  public void partialShutdownFailure_doesNotNackSuccessfullyResolvedHandleAgain() {
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer latest = mock(AckReplyConsumer.class);
+    doThrow(new IllegalStateException("Injected superseded-handle failure"))
+        .doNothing()
+        .when(original)
+        .nack();
+    ackTracker.trackMessageDelivery("message-id", original);
+    ackTracker.trackMessageDelivery("message-id", latest);
+    assertThrows(IllegalStateException.class, ackTracker::nackAll);
+    ackTracker.nackAll();
+    verify(latest).nack();
+    verify(original, times(2)).nack();
+    verify(latest, never()).ack();
+    verify(original, never()).ack();
   }
 
   @Test
@@ -176,6 +245,7 @@ public class PubSubAckTrackerTest {
     AckReplyConsumer latest = mock(AckReplyConsumer.class);
     AckReplyConsumer last = mock(AckReplyConsumer.class);
     doThrow(new IllegalStateException("Injected acknowledgement callback failure"))
+        .doNothing()
         .when(failed)
         .ack();
     ackTracker.addPendingAck("first", first);
@@ -195,17 +265,17 @@ public class PubSubAckTrackerTest {
     ackTracker.nackAll();
 
     verify(first, times(1)).ack();
-    verify(failed, times(1)).ack();
+    verify(failed, times(2)).ack();
     verify(latest, times(1)).ack();
     verify(last, times(1)).ack();
     verify(first, never()).nack();
-    verify(failed).nack();
+    verify(failed, never()).nack();
     verify(latest, never()).nack();
     verify(last, never()).nack();
   }
 
   @Test
-  public void singleAck_ackLatestMessageDelivery() throws Exception {
+  public void singleAck_ackEveryMessageDeliveryOnCheckpoint() throws Exception {
     AckReplyConsumer mockAck1 = mock(AckReplyConsumer.class);
     ackTracker.addPendingAck("message-id", mockAck1);
     AckReplyConsumer mockAck2 = mock(AckReplyConsumer.class);
@@ -214,12 +284,12 @@ public class PubSubAckTrackerTest {
     ackTracker.stagePendingAck("message-id");
     ackTracker.addCheckpoint(1L);
     ackTracker.notifyCheckpointComplete(1L);
-    verify(mockAck1, times(0)).ack();
+    verify(mockAck1, times(1)).ack();
     verify(mockAck2, times(1)).ack();
   }
 
   @Test
-  public void redeliveryAfterSnapshot_ackLatestDeliveryOnOriginalCheckpoint() {
+  public void redeliveryAfterSnapshot_ackEveryDeliveryOnOriginalCheckpoint() {
     AckReplyConsumer original = mock(AckReplyConsumer.class);
     AckReplyConsumer redelivery = mock(AckReplyConsumer.class);
     ackTracker.addPendingAck("message-id", original);
@@ -229,7 +299,7 @@ public class PubSubAckTrackerTest {
     ackTracker.addPendingAck("message-id", redelivery);
     ackTracker.notifyCheckpointComplete(1L);
 
-    verify(original, times(0)).ack();
+    verify(original).ack();
     verify(redelivery).ack();
     ackTracker.nackAll();
     verify(redelivery, times(0)).nack();
@@ -250,7 +320,7 @@ public class PubSubAckTrackerTest {
   }
 
   @Test
-  public void redeliveryAfterEmission_ackLatestDeliveryWhenCheckpointCompletes() {
+  public void redeliveryAfterEmission_ackEveryDeliveryWhenCheckpointCompletes() {
     AckReplyConsumer original = mock(AckReplyConsumer.class);
     AckReplyConsumer redelivery = mock(AckReplyConsumer.class);
     assertThat(ackTracker.trackMessageDelivery("message-id", original)).isTrue();
@@ -259,7 +329,7 @@ public class PubSubAckTrackerTest {
     ackTracker.addCheckpoint(1L);
     ackTracker.notifyCheckpointComplete(1L);
 
-    verify(original, times(0)).ack();
+    verify(original).ack();
     verify(redelivery).ack();
   }
 

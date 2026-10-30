@@ -17,8 +17,12 @@ package com.google.pubsub.flink.internal.source.reader;
 
 import com.google.cloud.pubsub.v1.AckReplyConsumer;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +58,7 @@ public class PubSubAckTracker implements AckTracker {
     redeliveries = group.counter("redeliveries", new ThreadSafeSimpleCounter());
     checkpointAckFailures = group.counter("checkpointAckFailures", new ThreadSafeSimpleCounter());
     group.gauge("outstandingMessages", (Gauge<Integer>) this::outstandingMessages);
+    group.gauge("outstandingDeliveryHandles", (Gauge<Integer>) this::outstandingDeliveryHandles);
     group.gauge("pendingMessages", (Gauge<Integer>) this::pendingMessages);
     group.gauge("stagedMessages", (Gauge<Integer>) this::stagedMessages);
     group.gauge("checkpointAckBatches", (Gauge<Integer>) this::checkpointAckBatches);
@@ -70,24 +75,19 @@ public class PubSubAckTracker implements AckTracker {
   private final SortedMap<Long, List<String>> checkpoints = new TreeMap<>();
 
   @Override
-  public boolean trackMessageDelivery(String messageId, AckReplyConsumer ackReplyConsumer) {
-    AckReplyConsumer previousConsumer;
-    synchronized (this) {
-      Delivery delivery = outstandingAcks.get(messageId);
-      if (delivery == null) {
-        outstandingAcks.put(messageId, new Delivery(ackReplyConsumer, nanoTime.getAsLong()));
-        pendingAcks.add(messageId);
-        return true;
-      }
-      previousConsumer = delivery.consumer;
-      delivery.consumer = ackReplyConsumer;
-      redeliveries.inc();
+  public synchronized boolean trackMessageDelivery(
+      String messageId, AckReplyConsumer ackReplyConsumer) {
+    Delivery delivery = outstandingAcks.get(messageId);
+    if (delivery == null) {
+      outstandingAcks.put(messageId, new Delivery(ackReplyConsumer, nanoTime.getAsLong()));
+      pendingAcks.add(messageId);
+      return true;
     }
-    // Each delivery owns SDK flow-control capacity and lease extensions. Retain only the newest
-    // handle for checkpoint acknowledgement, and release the old one without holding our lock.
-    if (previousConsumer != ackReplyConsumer) {
-      previousConsumer.nack();
-    }
+    // Old ACK IDs can still affect the current lease on standard subscriptions. NACKing one
+    // here can create a redelivery loop, and ACKing it would precede checkpoint completion.
+    // Keep every handle until checkpoint ACK or shutdown NACK releases its SDK flow-control slot.
+    delivery.add(ackReplyConsumer);
+    redeliveries.inc();
     return false;
   }
 
@@ -119,8 +119,9 @@ public class PubSubAckTracker implements AckTracker {
         for (String messageId : messages) {
           Delivery delivery = outstandingAcks.get(messageId);
           // Keep ownership until the callback returns. On failure, shutdown can still nack
-          // the delivery, or a later completion can retry it using its latest delivery handle.
-          delivery.consumer.ack();
+          // remaining handles, or a later completion can retry them. Each successful handle is
+          // removed immediately, so a partial failure never acknowledges it twice.
+          delivery.resolve(true);
           outstandingAcks.remove(messageId);
           acknowledged++;
         }
@@ -137,7 +138,7 @@ public class PubSubAckTracker implements AckTracker {
 
   @Override
   public synchronized void nackAll() {
-    outstandingAcks.values().forEach(delivery -> delivery.consumer.nack());
+    outstandingAcks.values().forEach(delivery -> delivery.resolve(false));
     outstandingAcks.clear();
     pendingAcks.clear();
     stagedAcks.clear();
@@ -146,6 +147,14 @@ public class PubSubAckTracker implements AckTracker {
 
   private synchronized int outstandingMessages() {
     return outstandingAcks.size();
+  }
+
+  private synchronized int outstandingDeliveryHandles() {
+    int count = 0;
+    for (Delivery delivery : outstandingAcks.values()) {
+      count += delivery.consumers.size();
+    }
+    return count;
   }
 
   private synchronized int pendingMessages() {
@@ -168,12 +177,35 @@ public class PubSubAckTracker implements AckTracker {
   }
 
   private static final class Delivery {
-    AckReplyConsumer consumer;
+    final Deque<AckReplyConsumer> consumers = new ArrayDeque<>();
+    final Set<AckReplyConsumer> handles = Collections.newSetFromMap(new IdentityHashMap<>());
     final long receivedNanos;
 
     Delivery(AckReplyConsumer consumer, long receivedNanos) {
-      this.consumer = consumer;
+      add(consumer);
       this.receivedNanos = receivedNanos;
+    }
+
+    void add(AckReplyConsumer consumer) {
+      if (!handles.add(consumer)) {
+        // A caller may present the same handle again, including after another delivery. Keep
+        // its newest position without resolving the same SDK handle more than once.
+        consumers.removeIf(existing -> existing == consumer);
+      }
+      consumers.addFirst(consumer);
+    }
+
+    void resolve(boolean acknowledge) {
+      while (!consumers.isEmpty()) {
+        AckReplyConsumer consumer = consumers.peekFirst();
+        if (acknowledge) {
+          consumer.ack();
+        } else {
+          consumer.nack();
+        }
+        consumers.removeFirst();
+        handles.remove(consumer);
+      }
     }
   }
 }

@@ -396,13 +396,20 @@ Each source reader registers the following metrics under its `pubsub` metric gro
 
 | Metric | Meaning |
 | --- | --- |
-| `outstandingMessages` | Distinct messages owned by the reader until its ACK callback returns. |
+| `outstandingMessages` | Distinct messages owned by the reader until its ACK callbacks return. |
+| `outstandingDeliveryHandles` | Unresolved delivery handles, including suppressed redeliveries. |
 | `pendingMessages` | Owned messages that have not been emitted downstream. |
 | `stagedMessages` | Emitted messages awaiting inclusion in a checkpoint. |
 | `checkpointAckBatches` | Checkpoint batches awaiting ACK callbacks. |
 | `oldestOutstandingAgeMillis` | Age since first local delivery of the oldest owned message. |
 | `redeliveries` | Repeated deliveries while the reader still owns that message. |
 | `checkpointAckFailures` | Checkpoint-completion attempts interrupted by an ACK callback exception. |
+
+Suppressed redeliveries retain their delivery handles until checkpoint completion
+or shutdown. They are not acknowledged early, and no immediate NACK is sent:
+a stale NACK can trigger another delivery on a standard subscription. These extra
+handles consume SDK flow-control capacity until resolved; compare
+`outstandingDeliveryHandles` with the distinct `outstandingMessages` count.
 
 The `pubsub.ack` and `pubsub.nack` groups separately report `requests`, `inFlight`,
 `oldestInFlightAgeMillis`, `callbackFailures`, and `responseFailures`.

@@ -163,6 +163,7 @@ public class PubSubReaderMetricsTest {
     clock.set(TimeUnit.MILLISECONDS.toNanos(100));
     tracker.addPendingAck("B", mock(AckReplyConsumer.class));
     assertThat(group.value("outstandingMessages")).isEqualTo(2);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(2);
     assertThat(group.value("pendingMessages")).isEqualTo(2);
     tracker.stagePendingAck("A");
     assertThat(group.value("pendingMessages")).isEqualTo(1);
@@ -173,12 +174,15 @@ public class PubSubReaderMetricsTest {
     clock.set(TimeUnit.MILLISECONDS.toNanos(250));
     tracker.addPendingAck("A", mock(AckReplyConsumer.class));
     assertThat(group.count("redeliveries")).isEqualTo(1);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(3);
     assertThat(group.value("oldestOutstandingAgeMillis")).isEqualTo(250L);
     tracker.notifyCheckpointComplete(1);
     assertThat(group.value("outstandingMessages")).isEqualTo(1);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(1);
     assertThat(group.value("oldestOutstandingAgeMillis")).isEqualTo(150L);
     tracker.nackAll();
     assertThat(group.value("outstandingMessages")).isEqualTo(0);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(0);
     assertThat(group.value("pendingMessages")).isEqualTo(0);
     assertThat(group.value("checkpointAckBatches")).isEqualTo(0);
     assertThat(group.value("oldestOutstandingAgeMillis")).isEqualTo(0L);
@@ -198,6 +202,26 @@ public class PubSubReaderMetricsTest {
     assertThat(group.value("checkpointAckBatches")).isEqualTo(1);
     tracker.nackAll();
     assertThat(group.value("outstandingMessages")).isEqualTo(0);
+  }
+
+  @Test
+  public void deliveryHandleGauge_deduplicatesIdentityAndRemovesSuccessfulAckPrefix() {
+    PubSubAckTracker tracker = new PubSubAckTracker(group, clock::get);
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer latest = mock(AckReplyConsumer.class);
+    org.mockito.Mockito.doThrow(new IllegalStateException("Callback failure")).when(original).ack();
+    tracker.trackMessageDelivery("A", original);
+    tracker.trackMessageDelivery("A", latest);
+    tracker.trackMessageDelivery("A", original);
+    tracker.trackMessageDelivery("A", latest);
+    assertThat(group.value("outstandingMessages")).isEqualTo(1);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(2);
+    tracker.stagePendingAck("A");
+    tracker.addCheckpoint(1);
+    assertThrows(IllegalStateException.class, () -> tracker.notifyCheckpointComplete(1));
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(1);
+    tracker.nackAll();
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(0);
   }
 
   private static final class RecordingGroup extends UnregisteredMetricsGroup {

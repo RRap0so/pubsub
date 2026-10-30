@@ -19,6 +19,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -94,8 +95,9 @@ public class PubSubNotifyingPullSubscriberTest {
 
     assertThat(subscriber.pullMessage().get()).isEqualTo(message);
     assertThat(subscriber.pullMessage().isPresent()).isFalse();
-    verify(original).nack();
+    verify(original, never()).nack();
     tracker.nackAll();
+    verify(original).nack();
     verify(latest).nack();
   }
 

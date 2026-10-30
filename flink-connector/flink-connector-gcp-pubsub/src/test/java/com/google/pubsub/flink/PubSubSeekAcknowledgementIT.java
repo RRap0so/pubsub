@@ -39,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
@@ -89,6 +90,182 @@ public class PubSubSeekAcknowledgementIT {
   public void exactlyOnceSubscription_oldAckAfterSeek_doesNotHideReplay() throws Exception {
     Assume.assumeTrue("Exactly-once delivery requires the real service", emulator == null);
     verifyReplay(true);
+  }
+
+  @Test(timeout = 120000)
+  public void standardSubscription_suppressedRedeliveriesWaitForCheckpointWithoutLooping()
+      throws Exception {
+    verifyDeferredRedeliveryHandles(false);
+  }
+
+  @Test(timeout = 120000)
+  public void exactlyOnceSubscription_suppressedRedeliveriesWaitForCheckpointWithoutLooping()
+      throws Exception {
+    Assume.assumeTrue("Exactly-once delivery requires the real service", emulator == null);
+    verifyDeferredRedeliveryHandles(true);
+  }
+
+  /**
+   * Forces a new delivery by expiring its predecessor's lease. No handle is resolved until the
+   * checkpoint: NACKing the superseded handle can trigger another immediate delivery on standard
+   * subscriptions. The current-handle NACK positive control verifies broker redelivery is active.
+   * This deterministic lease-expiry case does not simulate a StreamingPull reconnect duplicate
+   * while its predecessor's lease remains valid. Emulator results do not establish cloud behavior.
+   */
+  private void verifyDeferredRedeliveryHandles(boolean exactlyOnce) throws Exception {
+    String suffix = "superseded-nack-" + UUID.randomUUID();
+    String topic = "projects/" + project + "/topics/" + suffix;
+    String subscription = "projects/" + project + "/subscriptions/" + suffix;
+    boolean passed = false;
+    try {
+      api("PUT", topic, "{}");
+      api(
+          "PUT",
+          subscription,
+          "{\"topic\":\""
+              + topic
+              + "\",\"ackDeadlineSeconds\":120,\"enableExactlyOnceDelivery\":"
+              + exactlyOnce
+              + "}");
+      PublishResponse.Builder publication = PublishResponse.newBuilder();
+      JsonFormat.parser()
+          .merge(
+              api("POST", topic + ":publish", "{\"messages\":[{\"data\":\"QQ==\"}]}"), publication);
+      String messageId = publication.getMessageIds(0);
+      ReceivedMessage first = nextDelivery(subscription, messageId);
+      PubSubAckTracker tracker = new PubSubAckTracker();
+      AtomicInteger nackRequests = new AtomicInteger();
+      List<Integer> ackStatuses = new ArrayList<>();
+      assertTrue(
+          tracker.trackMessageDelivery(
+              messageId,
+              redeliveryConsumer(
+                  subscription, first.getAckId(), exactlyOnce, nackRequests, ackStatuses)));
+      tracker.stagePendingAck(messageId);
+      tracker.addCheckpoint(1);
+      api(
+          "POST",
+          subscription + ":modifyAckDeadline",
+          "{\"ackIds\":[\"" + first.getAckId() + "\"],\"ackDeadlineSeconds\":1}");
+      Thread.sleep(1100);
+      ReceivedMessage second = nextDelivery(subscription, messageId);
+      assertTrue("Redelivery must have a new ACK ID", !first.getAckId().equals(second.getAckId()));
+      assertTrue(
+          !tracker.trackMessageDelivery(
+              messageId,
+              redeliveryConsumer(
+                  subscription, second.getAckId(), exactlyOnce, nackRequests, ackStatuses)));
+      assertTrue(ackStatuses.isEmpty());
+      assertNoDelivery(subscription, Duration.ofSeconds(3));
+      assertEquals(0, nackRequests.get());
+
+      // Positive control: NACKing the CURRENT handle must cause another delivery. This proves
+      // that the observation uses an active subscription and a functional NACK path.
+      api(
+          "POST",
+          subscription + ":modifyAckDeadline",
+          "{\"ackIds\":[\"" + second.getAckId() + "\"],\"ackDeadlineSeconds\":0}");
+      ReceivedMessage third = nextDelivery(subscription, messageId);
+      assertTrue(
+          !tracker.trackMessageDelivery(
+              messageId,
+              redeliveryConsumer(
+                  subscription, third.getAckId(), exactlyOnce, nackRequests, ackStatuses)));
+      assertTrue(ackStatuses.isEmpty());
+      assertNoDelivery(subscription, Duration.ofSeconds(3));
+      assertEquals(0, nackRequests.get());
+      tracker.notifyCheckpointComplete(1);
+      tracker.nackAll();
+      assertEquals(
+          "Completion must not NACK an acknowledged current handle", 0, nackRequests.get());
+      assertEquals(3, ackStatuses.size());
+      assertEquals(
+          "The current handle must be acknowledged successfully",
+          Integer.valueOf(200),
+          ackStatuses.get(0));
+      assertNoDelivery(subscription, Duration.ofSeconds(2));
+      System.out.println(
+          "SUPERSEDED_NACK_REPRO exactlyOnce="
+              + exactlyOnce
+              + " forcedDeliveries=3 supersededNacks="
+              + nackRequests.get()
+              + " unexpectedDeliveries=0 checkpointAcknowledged=true");
+      passed = true;
+    } finally {
+      if (passed || emulator != null) {
+        delete(subscription);
+        delete(topic);
+      } else {
+        System.out.println(
+            "SUPERSEDED_NACK_REPRO retained topic=" + topic + " subscription=" + subscription);
+      }
+    }
+  }
+
+  private ReceivedMessage nextDelivery(String subscription, String expectedId) throws Exception {
+    long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+    while (System.nanoTime() < deadline) {
+      List<ReceivedMessage> deliveries = pull(subscription);
+      if (!deliveries.isEmpty()) {
+        assertEquals(1, deliveries.size());
+        assertEquals(expectedId, deliveries.get(0).getMessage().getMessageId());
+        return deliveries.get(0);
+      }
+      Thread.sleep(50);
+    }
+    throw new AssertionError("Expected delivery not received within 30 seconds");
+  }
+
+  private void assertNoDelivery(String subscription, Duration interval) throws Exception {
+    long deadline = System.nanoTime() + interval.toNanos();
+    while (System.nanoTime() < deadline) {
+      // Finish each pull instead of cancelling at the observation boundary. A cancelled REST pull
+      // can otherwise lease the positive-control delivery after the client has stopped waiting.
+      // The HTTP request timeout is 20s, well below the current delivery's 120s lease.
+      assertTrue(
+          "Unexpected delivery before its current lease expired", pull(subscription).isEmpty());
+      Thread.sleep(50);
+    }
+  }
+
+  private AckReplyConsumer redeliveryConsumer(
+      String subscription,
+      String ackId,
+      boolean exactlyOnce,
+      AtomicInteger nackRequests,
+      List<Integer> ackStatuses) {
+    return new AckReplyConsumer() {
+      @Override
+      public void ack() {
+        try {
+          int status = sendAck(subscription, ackId);
+          ackStatuses.add(status);
+          assertTrue(
+              "ACK failed: HTTP " + status,
+              status >= 200 && status < 300 || exactlyOnce && status == 400);
+        } catch (Exception failure) {
+          throw new IllegalStateException("Acknowledgement request failed", failure);
+        }
+      }
+
+      @Override
+      public void nack() {
+        nackRequests.incrementAndGet();
+        try {
+          int status =
+              request(
+                      "POST",
+                      subscription + ":modifyAckDeadline",
+                      "{\"ackIds\":[\"" + ackId + "\"],\"ackDeadlineSeconds\":0}")
+                  .statusCode();
+          assertTrue(
+              "Superseded NACK failed: HTTP " + status,
+              status >= 200 && status < 300 || exactlyOnce && status == 400);
+        } catch (Exception failure) {
+          throw new IllegalStateException("Negative acknowledgement request failed", failure);
+        }
+      }
+    };
   }
 
   private void verifyReplay(boolean exactlyOnce) throws Exception {

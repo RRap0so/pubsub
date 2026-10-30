@@ -23,8 +23,8 @@ public interface AckTracker {
    * Track a delivery and return whether its message should be emitted.
    *
    * <p>Implementations may suppress redeliveries of a message still awaiting checkpoint
-   * acknowledgement, while retaining the newest delivery's acknowledgement handle and resolving the
-   * superseded handle. The default preserves the behavior of trackers that do not suppress
+   * acknowledgement, while retaining every delivery's acknowledgement handle until checkpoint
+   * completion or shutdown. The default preserves the behavior of trackers that do not suppress
    * redeliveries.
    */
   default boolean trackMessageDelivery(String messageId, AckReplyConsumer ackReplyConsumer) {
@@ -36,8 +36,9 @@ public interface AckTracker {
    * Track a new pending ack. Acks are pending when a message has been received but not yet
    * processed by the Flink pipeline.
    *
-   * <p>If there is already a pending ack for {@code messageId}, the existing ack is replaced.
-   * Implementations that suppress redeliveries must also resolve the superseded handle.
+   * <p>Implementations that suppress redeliveries retain superseded handles and resolve them no
+   * later than checkpoint completion or shutdown. Resolving a handle early can acknowledge input
+   * before its checkpoint or trigger a redelivery loop.
    */
   void addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer);
 

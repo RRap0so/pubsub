@@ -38,7 +38,7 @@ public class PubSubAckTrackerStateMachineTest {
   private void verifySequence(long seed) {
     Random random = new Random(seed);
     PubSubAckTracker tracker = new PubSubAckTracker();
-    // Each record owns its latest delivery until a checkpoint covering its emission completes.
+    // Each record owns all its deliveries until a checkpoint covering its emission completes.
     // This model has no checkpoint queues or staged-ack lists, unlike the implementation.
     Map<String, Record> records = new HashMap<>();
     Map<String, Integer> expected = new HashMap<>();
@@ -54,10 +54,7 @@ public class PubSubAckTrackerStateMachineTest {
           String token = "delivery-" + step;
           boolean first = !records.containsKey(id);
           Record record = records.computeIfAbsent(id, unused -> new Record());
-          if (!first) {
-            expected.merge("nack:" + record.delivery, 1, Integer::sum);
-          }
-          record.delivery = token;
+          record.deliveries.add(token);
           assertEquals(
               context + " first delivery",
               first,
@@ -87,7 +84,9 @@ public class PubSubAckTrackerStateMachineTest {
             while (iterator.hasNext()) {
               Record committed = iterator.next();
               if (committed.checkpoint != null && committed.checkpoint <= completed) {
-                expected.merge("ack:" + committed.delivery, 1, Integer::sum);
+                for (String delivery : committed.deliveries) {
+                  expected.merge("ack:" + delivery, 1, Integer::sum);
+                }
                 iterator.remove();
               }
             }
@@ -96,7 +95,9 @@ public class PubSubAckTrackerStateMachineTest {
           break;
         default:
           for (Record outstanding : records.values()) {
-            expected.merge("nack:" + outstanding.delivery, 1, Integer::sum);
+            for (String delivery : outstanding.deliveries) {
+              expected.merge("nack:" + delivery, 1, Integer::sum);
+            }
           }
           records.clear();
           tracker.nackAll();
@@ -104,7 +105,9 @@ public class PubSubAckTrackerStateMachineTest {
       assertEquals(context + " acknowledgement ownership", expected, actual);
     }
     for (Record outstanding : records.values()) {
-      expected.merge("nack:" + outstanding.delivery, 1, Integer::sum);
+      for (String delivery : outstanding.deliveries) {
+        expected.merge("nack:" + delivery, 1, Integer::sum);
+      }
     }
     tracker.nackAll();
     assertEquals("seed=" + seed + " final shutdown", expected, actual);
@@ -125,7 +128,7 @@ public class PubSubAckTrackerStateMachineTest {
   }
 
   private static class Record {
-    String delivery;
+    final List<String> deliveries = new ArrayList<>();
     boolean emitted;
     Long checkpoint;
   }
