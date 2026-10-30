@@ -17,21 +17,18 @@ package com.google.pubsub.flink;
 
 import com.google.api.gax.core.FixedCredentialsProvider;
 import com.google.api.gax.core.NoCredentialsProvider;
-import com.google.api.gax.grpc.GrpcTransportChannel;
+import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import com.google.api.gax.rpc.FixedHeaderProvider;
-import com.google.api.gax.rpc.FixedTransportChannelProvider;
 import com.google.auth.Credentials;
 import com.google.auto.value.AutoValue;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.cloud.pubsub.v1.TopicAdminSettings;
 import com.google.common.base.Optional;
 import com.google.pubsub.flink.internal.sink.PubSubFlushablePublisher;
-import com.google.pubsub.flink.internal.sink.PubSubPublisherCache;
 import com.google.pubsub.flink.internal.sink.PubSubSinkWriter;
 import com.google.pubsub.flink.util.EmulatorEndpoint;
 import com.google.pubsub.v1.PubsubMessage;
 import com.google.pubsub.v1.TopicName;
-import io.grpc.ManagedChannelBuilder;
 import java.io.IOException;
 import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.connector.sink2.SinkWriter;
@@ -62,16 +59,8 @@ public abstract class PubSubSink<T> implements Sink<T> {
     return new AutoValue_PubSubSink.Builder<T>();
   }
 
-  private Publisher createPublisher(TopicName topicName) throws IOException {
+  Publisher createPublisher(TopicName topicName) throws IOException {
     Publisher.Builder builder = Publisher.newBuilder(topicName.toString());
-    // Channel settings copied from com.google.cloud:google-cloud-pubsub:1.124.1.
-    builder.setChannelProvider(
-        TopicAdminSettings.defaultGrpcTransportProviderBuilder()
-            .setChannelsPerCpu(1)
-            .setHeaderProvider(
-                FixedHeaderProvider.create(
-                    "x-goog-api-client", "PubSub-Flink-Connector/1.0.1-SNAPSHOT"))
-            .build());
     if (credentials().isPresent()) {
       builder.setCredentialsProvider(FixedCredentialsProvider.create(credentials().get()));
     }
@@ -85,12 +74,26 @@ public abstract class PubSubSink<T> implements Sink<T> {
     String emulatorEndpoint = EmulatorEndpoint.getEmulatorEndpoint(endpoint());
     if (emulatorEndpoint != null) {
       builder.setCredentialsProvider(NoCredentialsProvider.create());
-      builder.setChannelProvider(
-          FixedTransportChannelProvider.create(
-              GrpcTransportChannel.create(
-                  ManagedChannelBuilder.forTarget(emulatorEndpoint).usePlaintext().build())));
+      builder.setEndpoint(emulatorEndpoint);
     }
+    builder.setChannelProvider(createChannelProvider(emulatorEndpoint));
     return builder.build();
+  }
+
+  InstantiatingGrpcChannelProvider createChannelProvider(String emulatorEndpoint) {
+    InstantiatingGrpcChannelProvider.Builder provider =
+        TopicAdminSettings.defaultGrpcTransportProviderBuilder()
+            .setChannelsPerCpu(1)
+            .setHeaderProvider(
+                FixedHeaderProvider.create(
+                    "x-goog-api-client", "PubSub-Flink-Connector/1.0.1-SNAPSHOT"));
+    if (emulatorEndpoint != null) {
+      provider
+          .setEndpoint(emulatorEndpoint)
+          .setPoolSize(1)
+          .setChannelConfigurator(channel -> channel.usePlaintext());
+    }
+    return provider.build();
   }
 
   @Override
@@ -101,9 +104,7 @@ public abstract class PubSubSink<T> implements Sink<T> {
       throw new IOException(e);
     }
     return new PubSubSinkWriter<>(
-        new PubSubFlushablePublisher(
-            PubSubPublisherCache.getOrCreate(
-                TopicName.of(projectName(), topicName()), this::createPublisher)),
+        new PubSubFlushablePublisher(createPublisher(TopicName.of(projectName(), topicName()))),
         serializationSchema());
   }
 
