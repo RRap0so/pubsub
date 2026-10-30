@@ -32,6 +32,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.flink.annotation.Internal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -264,6 +265,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   }
 
   /** Aborts the supplied owned resources, preserving the primary failure and all cleanup errors. */
+  @Internal
   public static void forceCloseResources(
       Throwable failure, TransportChannel transport, ExecutorService... executors) {
     try {

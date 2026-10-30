@@ -20,19 +20,32 @@ import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
+import com.google.auth.oauth2.AccessToken;
+import com.google.auth.oauth2.GoogleCredentials;
 import com.google.cloud.pubsub.v1.Publisher;
+import com.google.common.base.Optional;
 import com.google.pubsub.flink.internal.sink.PubSubFlushablePublisher;
+import com.google.pubsub.flink.util.EmulatorEndpoint;
 import com.google.pubsub.v1.TopicName;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import java.io.IOException;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
@@ -184,6 +197,58 @@ public class PubSubSinkTest {
         .inOrder();
     verify(executor).shutdownNow();
     verify(callbacks).shutdownNow();
+  }
+
+  @Test
+  public void customEndpointWithCredentialsBuildsWriterAndUsesConfiguredTransport()
+      throws Exception {
+    String endpoint = "regional.pubsub.example:443";
+    GoogleCredentials credentials =
+        GoogleCredentials.create(
+            new AccessToken("unit-test-token", Date.from(Instant.now().plusSeconds(3600))));
+    var sink = spy(sinkBuilder().setEndpoint(endpoint).setCredentials(credentials).build());
+    List<ManagedChannel> channels = new ArrayList<>();
+    var provider =
+        sink.createChannelProvider(null).toBuilder()
+            .setPoolSize(1)
+            .setChannelConfigurator(
+                builder -> {
+                  ManagedChannelBuilder<?> observed = spy(builder);
+                  doAnswer(
+                          invocation -> {
+                            ManagedChannel channel = (ManagedChannel) invocation.callRealMethod();
+                            channels.add(channel);
+                            return channel;
+                          })
+                      .when(observed)
+                      .build();
+                  return observed;
+                })
+            .build();
+    doReturn(provider).when(sink).createChannelProvider(isNull());
+    // The integration profile exports an emulator host. Isolate this test's non-emulator path
+    // without changing process-wide environment variables or disabling credentials on the SDK.
+    try (var endpoints = mockStatic(EmulatorEndpoint.class)) {
+      endpoints
+          .when(() -> EmulatorEndpoint.getEmulatorEndpoint(Optional.of(endpoint)))
+          .thenReturn(null);
+      var writer = sink.createWriter(mock(WriterInitContext.class));
+      try {
+        assertThat(channels).isNotEmpty();
+        for (ManagedChannel channel : channels) {
+          assertThat(channel.authority()).isEqualTo(endpoint);
+        }
+      } finally {
+        writer.close();
+      }
+      for (ManagedChannel channel : channels) {
+        assertThat(channel.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+      }
+    } finally {
+      for (ManagedChannel channel : channels) {
+        channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+      }
+    }
   }
 
   private static PubSubSink.Builder<String> sinkBuilder() {
