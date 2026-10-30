@@ -18,17 +18,47 @@ package com.google.pubsub.flink.internal.source.reader;
 import com.google.cloud.pubsub.v1.AckReplyConsumer;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.Gauge;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.ThreadSafeSimpleCounter;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 
 public class PubSubAckTracker implements AckTracker {
   @GuardedBy("this")
-  private final Map<String, AckReplyConsumer> outstandingAcks = new HashMap<>();
+  private final Map<String, Delivery> outstandingAcks = new LinkedHashMap<>();
+
+  private final LongSupplier nanoTime;
+  private final Counter redeliveries;
+  private final Counter checkpointAckFailures;
+
+  public PubSubAckTracker() {
+    this(new UnregisteredMetricsGroup());
+  }
+
+  public PubSubAckTracker(MetricGroup group) {
+    this(group, System::nanoTime);
+  }
+
+  PubSubAckTracker(MetricGroup group, LongSupplier nanoTime) {
+    this.nanoTime = nanoTime;
+    redeliveries = group.counter("redeliveries", new ThreadSafeSimpleCounter());
+    checkpointAckFailures = group.counter("checkpointAckFailures", new ThreadSafeSimpleCounter());
+    group.gauge("outstandingMessages", (Gauge<Integer>) this::outstandingMessages);
+    group.gauge("pendingMessages", (Gauge<Integer>) this::pendingMessages);
+    group.gauge("stagedMessages", (Gauge<Integer>) this::stagedMessages);
+    group.gauge("checkpointAckBatches", (Gauge<Integer>) this::checkpointAckBatches);
+    group.gauge("oldestOutstandingAgeMillis", (Gauge<Long>) this::oldestOutstandingAgeMillis);
+  }
 
   @GuardedBy("this")
   private final Set<String> pendingAcks = new HashSet<>();
@@ -42,10 +72,14 @@ public class PubSubAckTracker implements AckTracker {
   @Override
   public synchronized boolean trackMessageDelivery(
       String messageId, AckReplyConsumer ackReplyConsumer) {
-    boolean firstDelivery = !outstandingAcks.containsKey(messageId);
-    outstandingAcks.put(messageId, ackReplyConsumer);
+    Delivery delivery = outstandingAcks.get(messageId);
+    boolean firstDelivery = delivery == null;
     if (firstDelivery) {
+      outstandingAcks.put(messageId, new Delivery(ackReplyConsumer, nanoTime.getAsLong()));
       pendingAcks.add(messageId);
+    } else {
+      delivery.consumer = ackReplyConsumer;
+      redeliveries.inc();
     }
     return firstDelivery;
   }
@@ -76,13 +110,16 @@ public class PubSubAckTracker implements AckTracker {
       int acknowledged = 0;
       try {
         for (String messageId : messages) {
-          AckReplyConsumer consumer = outstandingAcks.get(messageId);
+          Delivery delivery = outstandingAcks.get(messageId);
           // Keep ownership until the callback returns. On failure, shutdown can still nack
           // the delivery, or a later completion can retry it using its latest delivery handle.
-          consumer.ack();
-          outstandingAcks.remove(messageId, consumer);
+          delivery.consumer.ack();
+          outstandingAcks.remove(messageId);
           acknowledged++;
         }
+      } catch (RuntimeException | Error failure) {
+        checkpointAckFailures.inc();
+        throw failure;
       } finally {
         // Discard the successful prefix in one linear operation, including after partial failure.
         messages.subList(0, acknowledged).clear();
@@ -93,10 +130,43 @@ public class PubSubAckTracker implements AckTracker {
 
   @Override
   public synchronized void nackAll() {
-    outstandingAcks.values().forEach((ackReplyConsumer) -> ackReplyConsumer.nack());
+    outstandingAcks.values().forEach(delivery -> delivery.consumer.nack());
     outstandingAcks.clear();
     pendingAcks.clear();
     stagedAcks.clear();
     checkpoints.clear();
+  }
+
+  private synchronized int outstandingMessages() {
+    return outstandingAcks.size();
+  }
+
+  private synchronized int pendingMessages() {
+    return pendingAcks.size();
+  }
+
+  private synchronized int stagedMessages() {
+    return stagedAcks.size();
+  }
+
+  private synchronized int checkpointAckBatches() {
+    return checkpoints.size();
+  }
+
+  private synchronized long oldestOutstandingAgeMillis() {
+    return outstandingAcks.isEmpty()
+        ? 0
+        : TimeUnit.NANOSECONDS.toMillis(
+            nanoTime.getAsLong() - outstandingAcks.values().iterator().next().receivedNanos);
+  }
+
+  private static final class Delivery {
+    AckReplyConsumer consumer;
+    final long receivedNanos;
+
+    Delivery(AckReplyConsumer consumer, long receivedNanos) {
+      this.consumer = consumer;
+      this.receivedNanos = receivedNanos;
+    }
   }
 }

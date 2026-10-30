@@ -23,6 +23,7 @@ import com.google.api.gax.rpc.FixedHeaderProvider;
 import com.google.auth.Credentials;
 import com.google.auto.value.AutoValue;
 import com.google.cloud.pubsub.v1.MessageReceiver;
+import com.google.cloud.pubsub.v1.MessageReceiverWithAckResponse;
 import com.google.cloud.pubsub.v1.Subscriber;
 import com.google.cloud.pubsub.v1.SubscriptionAdminSettings;
 import com.google.common.base.Optional;
@@ -34,6 +35,7 @@ import com.google.pubsub.flink.internal.source.enumerator.PubSubSplitEnumerator;
 import com.google.pubsub.flink.internal.source.reader.AckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubAckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubNotifyingPullSubscriber;
+import com.google.pubsub.flink.internal.source.reader.PubSubReaderMetrics;
 import com.google.pubsub.flink.internal.source.reader.PubSubSourceReader;
 import com.google.pubsub.flink.internal.source.reader.PubSubSplitReader;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
@@ -58,6 +60,7 @@ import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.util.UserCodeClassLoader;
 import org.threeten.bp.Duration;
 
@@ -101,9 +104,16 @@ public abstract class PubSubSource<OutputT>
   }
 
   Subscriber createSubscriber(MessageReceiver receiver) {
+    return createSubscriber(receiver, new PubSubReaderMetrics(new UnregisteredMetricsGroup()));
+  }
+
+  Subscriber createSubscriber(MessageReceiver receiver, PubSubReaderMetrics metrics) {
+    MessageReceiverWithAckResponse observedReceiver =
+        (message, consumer) -> receiver.receiveMessage(message, metrics.observe(consumer));
     Subscriber.Builder builder =
         Subscriber.newBuilder(
-            ProjectSubscriptionName.of(projectName(), subscriptionName()).toString(), receiver);
+            ProjectSubscriptionName.of(projectName(), subscriptionName()).toString(),
+            observedReceiver);
     builder.setFlowControlSettings(
         FlowControlSettings.newBuilder()
             .setMaxOutstandingElementCount(maxOutstandingMessagesCount().or(1000L))
@@ -147,9 +157,11 @@ public abstract class PubSubSource<OutputT>
     return provider.build();
   }
 
-  private PubSubSplitReader createSplitReader(AckTracker ackTracker) {
+  private PubSubSplitReader createSplitReader(AckTracker ackTracker, PubSubReaderMetrics metrics) {
     return new PubSubSplitReader(
-        () -> new PubSubNotifyingPullSubscriber(this::createSubscriber, ackTracker));
+        () ->
+            new PubSubNotifyingPullSubscriber(
+                receiver -> createSubscriber(receiver, metrics), ackTracker));
   }
 
   @Override
@@ -173,10 +185,12 @@ public abstract class PubSubSource<OutputT>
             return null;
           }
         });
+    MetricGroup metrics = readerContext.metricGroup().addGroup("pubsub");
+    PubSubReaderMetrics acknowledgementMetrics = new PubSubReaderMetrics(metrics);
     return new PubSubSourceReader<>(
         schema,
-        new PubSubAckTracker(),
-        this::createSplitReader,
+        new PubSubAckTracker(metrics),
+        ackTracker -> createSplitReader(ackTracker, acknowledgementMetrics),
         new Configuration(),
         readerContext);
   }

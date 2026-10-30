@@ -414,7 +414,7 @@ public class PubSubCheckpointRecoveryEmulatorTest {
                   });
             })
         .when(source)
-        .createSubscriber(any());
+        .createSubscriber(any(), any());
     SourceReader<String, SubscriptionSplit> original = reader(null);
     Set<String> expected = new HashSet<>();
     for (int start = 0; start < total; start += 100) {

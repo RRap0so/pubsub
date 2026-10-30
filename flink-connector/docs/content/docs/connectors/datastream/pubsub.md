@@ -378,6 +378,37 @@ attributes or ordering keys.
   </tbody>
 </table>
 
+## Source diagnostics
+
+Each source reader registers the following metrics under its `pubsub` metric group:
+
+| Metric | Meaning |
+| --- | --- |
+| `outstandingMessages` | Distinct messages owned by the reader until its ACK callback returns. |
+| `pendingMessages` | Owned messages that have not been emitted downstream. |
+| `stagedMessages` | Emitted messages awaiting inclusion in a checkpoint. |
+| `checkpointAckBatches` | Checkpoint batches awaiting ACK callbacks. |
+| `oldestOutstandingAgeMillis` | Age since first local delivery of the oldest owned message. |
+| `redeliveries` | Repeated deliveries while the reader still owns that message. |
+| `checkpointAckFailures` | Checkpoint-completion attempts interrupted by an ACK callback exception. |
+
+The `pubsub.ack` and `pubsub.nack` groups separately report `requests`, `inFlight`,
+`oldestInFlightAgeMillis`, `callbackFailures`, and `responseFailures`.
+Their `responses` subgroups count SDK outcomes: `successful`, `invalid`,
+`permission_denied`, `failed_precondition`, and `other`. `responseFailures` also
+includes futures that fail exceptionally or are cancelled. These observations are
+asynchronous and do not block checkpoint completion or change replay ownership.
+
+**SDK success is not always broker confirmation.** When exactly-once delivery is
+disabled on the subscription, the SDK returns immediate success. Server-confirmed
+outcomes require exactly-once delivery on the subscription; this connector does not
+enable it automatically. See the
+[SDK acknowledgement contract](https://cloud.google.com/java/docs/reference/google-cloud-pubsub/latest/com.google.cloud.pubsub.v1.AckReplyConsumerWithResponse).
+
+These gauges describe local reader ownership and SDK operations, not the complete
+Pub/Sub subscription backlog or messages still buffered inside the SDK. Metrics do
+not contain message IDs, acknowledgement IDs, or payloads.
+
 ## Integration Testing
 
 Instead of integration tests reading from and writing to production Google Cloud
