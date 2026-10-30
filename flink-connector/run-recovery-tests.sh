@@ -16,7 +16,14 @@ trap cleanup EXIT
 if [[ -z "${CHECKPOINT_TEST_EMULATOR:-}" ]]; then
   emulator_bin="${PUBSUB_EMULATOR_BIN:-}"
   if [[ -z "$emulator_bin" ]]; then
-    sdk_root=$(gcloud info --format='value(installation.sdk_root)' 2>/dev/null)
+    if ! command -v gcloud > /dev/null 2>&1; then
+      echo "gcloud is not installed. Install the Pub/Sub emulator or set PUBSUB_EMULATOR_BIN." >&2
+      exit 1
+    fi
+    if ! sdk_root=$(gcloud info --format='value(installation.sdk_root)' 2>/dev/null); then
+      echo "Unable to locate the Google Cloud SDK. Set PUBSUB_EMULATOR_BIN explicitly." >&2
+      exit 1
+    fi
     emulator_bin="$sdk_root/platform/pubsub-emulator/bin/cloud-pubsub-emulator"
   fi
   if [[ ! -x "$emulator_bin" ]]; then

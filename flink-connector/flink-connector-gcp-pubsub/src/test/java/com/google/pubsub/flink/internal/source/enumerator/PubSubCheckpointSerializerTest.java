@@ -41,12 +41,21 @@ public final class PubSubCheckpointSerializerTest {
 
   @Test
   public void deserialize_readsLegacyVersionZero() throws Exception {
-    PubSubEnumeratorCheckpoint checkpoint =
-        PubSubEnumeratorCheckpoint.newBuilder()
-            .addAssignments(PubSubEnumeratorCheckpoint.Assignment.newBuilder().setSubtask(1))
-            .build();
-    assertThat(new PubSubCheckpointSerializer().deserialize(0, checkpoint.toByteArray()))
-        .isEqualTo(checkpoint);
+    // Golden bytes generated with master's serializer and proto at
+    // cd7d07bbfa4b81afc148f31a091f9b0d958dbe01.
+    byte[] bytes;
+    try (var input = getClass().getResourceAsStream("/checkpoints/enumerator-v0.bin")) {
+      assertThat(input).isNotNull();
+      bytes = input.readAllBytes();
+    }
+    var checkpoint = new PubSubCheckpointSerializer().deserialize(0, bytes);
+    assertThat(checkpoint.getAssignmentsCount()).isEqualTo(1);
+    assertThat(checkpoint.getAssignments(0).getSubtask()).isEqualTo(3);
+    assertThat(checkpoint.getAssignments(0).getSplit().getSubscription())
+        .isEqualTo("projects/golden/subscriptions/input");
+    assertThat(checkpoint.getAssignments(0).getSplit().getUid()).isEqualTo("reader-3");
+    assertThat(checkpoint.getReplaySnapshotNamespace()).isEmpty();
+    assertThat(checkpoint.getReplayDeduplicationRequired()).isFalse();
   }
 
   @Test

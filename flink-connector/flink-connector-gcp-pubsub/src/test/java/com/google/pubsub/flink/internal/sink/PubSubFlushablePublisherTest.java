@@ -267,7 +267,7 @@ public class PubSubFlushablePublisherTest {
                 flushablePublisher.flush();
                 return null;
               });
-      assertThat(flushFuture.isDone()).isFalse();
+      assertThrows(TimeoutException.class, () -> flushFuture.get(200, TimeUnit.MILLISECONDS));
       messageFuture.set("ack-id");
       flushFuture.get(5, TimeUnit.SECONDS);
     } finally {
