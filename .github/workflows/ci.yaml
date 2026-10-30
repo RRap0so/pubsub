@@ -109,6 +109,9 @@ jobs:
           done
           cat "$RUNNER_TEMP/pubsub-emulator.log"
           exit 1
+      - name: Check Flink connector formatting
+        working-directory: flink-connector
+        run: mvn -B com.spotify.fmt:fmt-maven-plugin:2.23:check
       - name: Verify Flink connector and recovery integration tests
         working-directory: flink-connector
         run: mvn -B -Precovery-it clean verify

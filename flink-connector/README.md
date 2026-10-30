@@ -89,6 +89,9 @@ Start an installed emulator in a separate terminal:
 gcloud beta emulators pubsub start --project=checkpoint-repro --host-port=127.0.0.1:8085 --quiet
 ```
 
+Any free loopback port works. If 8085 is already in use, pick another port and use
+the same value for `CHECKPOINT_TEST_EMULATOR` below.
+
 Then run unit tests and integration tests through Maven's `verify` phase:
 
 ```sh
