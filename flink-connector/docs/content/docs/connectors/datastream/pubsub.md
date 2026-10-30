@@ -142,7 +142,9 @@ to that snapshot before a coordinator readiness event permits restored readers t
 recovery rather than silently skipping input.
 
 This option is disabled by default and requires a dedicated subscription and
-snapshot create, get, list, delete, and seek permissions. It retains the last
+snapshot create, get, list, delete, and seek permissions. Checkpoints written by this
+version use a newer enumerator state format, so older connector versions cannot restore
+them; downgrading the connector requires starting from fresh source state. It retains the last
 `count` completed provider boundaries plus one shared pending boundary. Savepoints
 without completion notifications can share an earlier boundary.
 
