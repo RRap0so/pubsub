@@ -18,6 +18,8 @@ package com.google.pubsub.flink;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -26,9 +28,12 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import com.google.cloud.pubsub.v1.Publisher;
+import com.google.pubsub.flink.internal.sink.PubSubFlushablePublisher;
 import com.google.pubsub.v1.TopicName;
 import java.io.IOException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
@@ -99,10 +104,14 @@ public class PubSubSinkTest {
                 .build());
     Publisher firstPublisher = mock(Publisher.class);
     Publisher secondPublisher = mock(Publisher.class);
-    doReturn(firstPublisher).when(first).createPublisher(TopicName.of("project", "topic"));
-    doReturn(secondPublisher).when(second).createPublisher(TopicName.of("project", "topic"));
-    when(firstPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
-    when(secondPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    doReturn(new PubSubFlushablePublisher(firstPublisher))
+        .when(first)
+        .createPublisher(TopicName.of("project", "topic"));
+    doReturn(new PubSubFlushablePublisher(secondPublisher))
+        .when(second)
+        .createPublisher(TopicName.of("project", "topic"));
+    when(firstPublisher.awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS))).thenReturn(true);
+    when(secondPublisher.awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS))).thenReturn(true);
     var firstWriter = first.createWriter(mock(WriterInitContext.class));
     var secondWriter = second.createWriter(mock(WriterInitContext.class));
     try {
@@ -128,6 +137,24 @@ public class PubSubSinkTest {
         .hasCauseThat()
         .isSameInstanceAs(failure);
     verify(sink, never()).createPublisher(any(TopicName.class));
+  }
+
+  @Test
+  public void transportCreationFailureClosesAllocatedExecutor() throws Exception {
+    var sink = spy(sinkBuilder().setEndpoint("emulator:///127.0.0.1:23456").build());
+    ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+    ScheduledExecutorService callbacks = mock(ScheduledExecutorService.class);
+    InstantiatingGrpcChannelProvider provider = mock(InstantiatingGrpcChannelProvider.class);
+    IOException failure = new IOException("Transport creation failed");
+    doReturn(executor).when(sink).createExecutor();
+    doReturn(callbacks).when(sink).createCallbackExecutor();
+    doReturn(provider).when(sink).createChannelProvider(any());
+    when(provider.getTransportChannel()).thenThrow(failure);
+    assertThat(
+            assertThrows(IOException.class, () -> sink.createWriter(mock(WriterInitContext.class))))
+        .isSameInstanceAs(failure);
+    verify(executor).shutdownNow();
+    verify(callbacks).shutdownNow();
   }
 
   private static PubSubSink.Builder<String> sinkBuilder() {

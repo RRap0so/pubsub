@@ -291,9 +291,13 @@ redelivered by Google Cloud Pub/Sub.
 
 Closing a sink writer waits at most 30 seconds for flushing pending publishes and
 shutting down the publisher. A timeout or task-thread interruption is reported as
-an error; pending publishes are not reported as successful. The SDK may continue
-its shutdown retries on a daemon thread after the writer stops waiting. Normal
-checkpoint flushes still wait for publish results and report publish failures.
+an error; pending publishes are not reported as successful. The writer owns its
+transport, retry scheduler, and callback executor. On timeout or interruption it
+aborts the transport and retry scheduler; callbacks remain runnable until pending
+publishes finish failing, then the cleanup worker closes their executor. Normal
+publish retries are unchanged. Normal checkpoint flushes still wait for publish
+results and report publish failures. Cleanup workers have unique names; if the
+caller stops waiting, logs report the abort and eventual cleanup result.
 
 Pub/Sub sink publishes data to a single Google Cloud Pub/Sub topic with an
 at-least-once guarantee. The sample below shows the minimal configurations

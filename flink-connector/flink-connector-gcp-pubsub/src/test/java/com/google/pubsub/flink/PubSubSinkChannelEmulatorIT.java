@@ -32,6 +32,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.connector.sink2.SinkWriter;
@@ -41,10 +42,14 @@ import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
-/** Verifies SDK-owned publisher transport closure against an isolated local emulator topic. */
+/**
+ * Verifies writer-owned publisher transport and executor closure against an isolated local emulator
+ * topic.
+ */
 public class PubSubSinkChannelEmulatorIT {
   private final HttpClient http = HttpClient.newHttpClient();
   private final List<ManagedChannel> channels = new ArrayList<>();
+  private final List<ScheduledExecutorService> executors = new ArrayList<>();
   private String endpoint;
   private String topic;
   private SinkWriter<String> writer;
@@ -73,6 +78,24 @@ public class PubSubSinkChannelEmulatorIT {
                 .setSerializationSchema(
                     PubSubSerializationSchema.dataOnly(new SimpleStringSchema()))
                 .build());
+    doAnswer(
+            invocation -> {
+              ScheduledExecutorService executor =
+                  (ScheduledExecutorService) invocation.callRealMethod();
+              executors.add(executor);
+              return executor;
+            })
+        .when(sink)
+        .createExecutor();
+    doAnswer(
+            invocation -> {
+              ScheduledExecutorService executor =
+                  (ScheduledExecutorService) invocation.callRealMethod();
+              executors.add(executor);
+              return executor;
+            })
+        .when(sink)
+        .createCallbackExecutor();
     doAnswer(
             invocation -> {
               InstantiatingGrpcChannelProvider provider =
@@ -104,6 +127,11 @@ public class PubSubSinkChannelEmulatorIT {
       assertTrue("Publisher transport must remain open until close", !channel.isShutdown());
     }
     writer.close();
+    for (ScheduledExecutorService executor : executors) {
+      assertTrue(
+          "Sink close must terminate its publisher executor",
+          executor.awaitTermination(5, TimeUnit.SECONDS));
+    }
     for (ManagedChannel channel : channels) {
       assertTrue(
           "Sink close must terminate its publisher transport",
@@ -120,6 +148,10 @@ public class PubSubSinkChannelEmulatorIT {
     } finally {
       for (ManagedChannel channel : channels) {
         channel.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+      }
+      for (ScheduledExecutorService executor : executors) {
+        executor.shutdownNow();
+        executor.awaitTermination(5, TimeUnit.SECONDS);
       }
       if (topic != null) {
         api("DELETE", topic, "");

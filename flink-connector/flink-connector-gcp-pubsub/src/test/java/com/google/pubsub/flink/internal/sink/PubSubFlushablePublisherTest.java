@@ -17,14 +17,18 @@ package com.google.pubsub.flink.internal.sink;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.api.core.ApiFutures;
 import com.google.api.core.SettableApiFuture;
+import com.google.api.gax.rpc.TransportChannel;
 import com.google.cloud.pubsub.v1.Publisher;
 import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.protobuf.ByteString;
@@ -33,6 +37,7 @@ import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -177,6 +182,44 @@ public class PubSubFlushablePublisherTest {
   }
 
   @Test
+  public void constructor_rejectsNonpositiveCloseTimeout() {
+    for (long timeout : new long[] {0, -1}) {
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> new PubSubFlushablePublisher(mockPublisher, timeout, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  public void close_terminationWaitUsesRemainingConfiguredBudget() throws Exception {
+    flushablePublisher = new PubSubFlushablePublisher(mockPublisher, 1, TimeUnit.SECONDS);
+    when(mockPublisher.awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS)))
+        .thenAnswer(
+            invocation -> {
+              long remaining = invocation.getArgument(0);
+              assertThat(remaining).isGreaterThan(0L);
+              assertThat(remaining).isAtMost(TimeUnit.SECONDS.toNanos(1));
+              return true;
+            });
+    flushablePublisher.close();
+  }
+
+  @Test
+  public void close_shutdownFailureStillForcesBothOwnedResources() {
+    TransportChannel transport = mock(TransportChannel.class);
+    ScheduledExecutorService executor = mock(ScheduledExecutorService.class);
+    RuntimeException sdkFailure = new RuntimeException("SDK shutdown failed");
+    RuntimeException transportFailure = new RuntimeException("Transport abort failed");
+    doThrow(sdkFailure).when(mockPublisher).shutdown();
+    doThrow(transportFailure).when(transport).shutdownNow();
+    flushablePublisher = new PubSubFlushablePublisher(mockPublisher, transport, executor, null);
+    IOException failure = assertThrows(IOException.class, flushablePublisher::close);
+    assertThat(failure).hasCauseThat().isSameInstanceAs(sdkFailure);
+    assertThat(failure.getSuppressed()).asList().containsExactly(transportFailure);
+    verify(executor).shutdownNow();
+  }
+
+  @Test
   public void publish_success() throws Exception {
     PubsubMessage message =
         PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("message")).build();
@@ -268,15 +311,16 @@ public class PubSubFlushablePublisherTest {
 
   @Test
   public void close_flushesShutsDownAndWaitsOnce() throws Exception {
-    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    when(mockPublisher.awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS))).thenReturn(true);
     flushablePublisher.close();
     flushablePublisher.close();
     verify(mockPublisher).publishAllOutstanding();
     verify(mockPublisher).shutdown();
-    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
+    verify(mockPublisher).awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS));
     assertThrows(
         IllegalStateException.class,
         () -> flushablePublisher.publish(PubsubMessage.getDefaultInstance()));
+    assertThrows(IOException.class, flushablePublisher::flush);
   }
 
   @Test
@@ -284,13 +328,13 @@ public class PubSubFlushablePublisherTest {
     PubsubMessage message = PubsubMessage.getDefaultInstance();
     RuntimeException failure = new RuntimeException("rejected publication");
     when(mockPublisher.publish(message)).thenReturn(ApiFutures.immediateFailedFuture(failure));
-    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    when(mockPublisher.awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS))).thenReturn(true);
     flushablePublisher.publish(message);
     assertThat(assertThrows(IOException.class, flushablePublisher::close))
         .hasCauseThat()
         .isSameInstanceAs(failure);
     verify(mockPublisher).shutdown();
-    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
+    verify(mockPublisher).awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS));
   }
 
   @Test
@@ -310,7 +354,7 @@ public class PubSubFlushablePublisherTest {
 
   @Test
   public void close_workerInterruptionDoesNotInterruptCaller() throws Exception {
-    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS))
+    when(mockPublisher.awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS)))
         .thenThrow(new InterruptedException("shutdown interrupted"));
     try {
       IOException failure = assertThrows(IOException.class, flushablePublisher::close);
@@ -333,7 +377,7 @@ public class PubSubFlushablePublisherTest {
               return true;
             })
         .when(mockPublisher)
-        .awaitTermination(30, TimeUnit.SECONDS);
+        .awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS));
     flushablePublisher.publish(message);
     try {
       Thread.currentThread().interrupt();
@@ -345,7 +389,7 @@ public class PubSubFlushablePublisherTest {
     }
     assertThat(terminated.await(5, TimeUnit.SECONDS)).isTrue();
     verify(mockPublisher).shutdown();
-    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
+    verify(mockPublisher).awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS));
   }
 
   @Test
@@ -353,6 +397,6 @@ public class PubSubFlushablePublisherTest {
     IOException failure = assertThrows(IOException.class, flushablePublisher::close);
     assertThat(failure).hasMessageThat().contains("did not terminate");
     verify(mockPublisher).shutdown();
-    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
+    verify(mockPublisher).awaitTermination(anyLong(), eq(TimeUnit.NANOSECONDS));
   }
 }
