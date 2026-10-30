@@ -15,6 +15,7 @@
  */
 package com.google.pubsub.flink.internal.source.enumerator;
 
+import com.google.pubsub.flink.internal.source.reader.PubSubReplayReadyEvent;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
 import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import com.google.pubsub.v1.ProjectSubscriptionName;
@@ -66,6 +67,9 @@ public class PubSubSplitEnumerator
     this.context = context;
     this.readersWithAssignments = readersWithAssignments;
     this.replaySnapshots = replaySnapshots;
+    if (replaySnapshots != null && context.metricGroup() != null) {
+      replaySnapshots.registerMetrics(context.metricGroup().addGroup("pubsub"));
+    }
   }
 
   @Override
@@ -83,6 +87,9 @@ public class PubSubSplitEnumerator
 
   @Override
   public void addReader(int subtaskId) {
+    if (replaySnapshots != null) {
+      context.sendEventToSourceReader(subtaskId, PubSubReplayReadyEvent.INSTANCE);
+    }
     checkForUnassignedReaders();
   }
 

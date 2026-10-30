@@ -18,12 +18,20 @@ package com.google.pubsub.flink.internal.source.enumerator;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.google.api.gax.grpc.GrpcStatusCode;
+import com.google.api.gax.rpc.FailedPreconditionException;
 import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
+import io.grpc.Status;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.Gauge;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.junit.Test;
 
 public class PubSubReplaySnapshotsTest {
@@ -104,14 +112,14 @@ public class PubSubReplaySnapshotsTest {
   }
 
   @Test
-  public void freshRestart_reclaimsUncheckpointedAttemptsWithinStableNamespace() {
+  public void freshRestart_preservesUnknownSnapshotsWithinStableNamespace() {
     String namespace = "00000000000000000000000000000000";
     PubSubReplaySnapshots firstAttempt = PubSubReplaySnapshots.startFresh(store, 1, namespace);
-    snapshot(firstAttempt, 1);
+    PubSubEnumeratorCheckpoint existing = snapshot(firstAttempt, 1);
     snapshot(firstAttempt, 2);
     PubSubEnumeratorCheckpoint unrelated = snapshot(new PubSubReplaySnapshots(store, 1), 1);
     PubSubReplaySnapshots.startFresh(store, 1, namespace);
-    assertThat(store.resources).containsExactly(name(unrelated));
+    assertThat(store.resources).containsExactly(name(existing), name(unrelated));
   }
 
   @Test
@@ -246,12 +254,12 @@ public class PubSubReplaySnapshotsTest {
     manager.notifyCheckpointComplete(1);
     PubSubEnumeratorCheckpoint second = snapshot(manager, 2);
     store.failedDeletions.add(name(first));
-    assertThrows(IllegalStateException.class, () -> manager.notifyCheckpointComplete(2));
+    manager.notifyCheckpointComplete(2);
     int creates = store.creates;
-    assertThrows(IllegalStateException.class, () -> snapshot(manager, 3));
+    assertThat(name(snapshot(manager, 3))).isEqualTo(name(second));
     assertThat(store.creates).isEqualTo(creates);
     store.failedDeletions.clear();
-    PubSubEnumeratorCheckpoint third = snapshot(manager, 3);
+    PubSubEnumeratorCheckpoint third = snapshot(manager, 4);
     assertThat(store.resources).containsExactly(name(second), name(third));
   }
 
@@ -267,7 +275,7 @@ public class PubSubReplaySnapshotsTest {
   }
 
   @Test
-  public void recovery_cleansOrphansBeforeNewCheckpointsAndPreservesOtherNamespaces() {
+  public void recovery_preservesNewerBoundariesAndOtherNamespaces() {
     PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 2);
     PubSubEnumeratorCheckpoint checkpoint = snapshot(original, 1);
     original.notifyCheckpointComplete(1);
@@ -275,11 +283,12 @@ public class PubSubReplaySnapshotsTest {
     original.notifyCheckpointComplete(2);
     PubSubEnumeratorCheckpoint unrelated = snapshot(new PubSubReplaySnapshots(store, 1), 1);
     PubSubReplaySnapshots restored = PubSubReplaySnapshots.restore(store, 2, checkpoint);
-    assertThat(store.resources).doesNotContain(name(orphan));
+    assertThat(store.resources).contains(name(orphan));
     assertThat(store.resources).contains(name(checkpoint));
     PubSubEnumeratorCheckpoint next = snapshot(restored, 3);
     restored.notifyCheckpointComplete(3);
-    assertThat(store.resources).containsExactly(name(checkpoint), name(next), name(unrelated));
+    assertThat(store.resources)
+        .containsExactly(name(checkpoint), name(orphan), name(next), name(unrelated));
   }
 
   @Test
@@ -289,11 +298,10 @@ public class PubSubReplaySnapshotsTest {
     original.notifyCheckpointComplete(1);
     PubSubEnumeratorCheckpoint second = snapshot(original, 2);
     store.failedDeletions.add(name(first));
-    assertThrows(IllegalStateException.class, () -> original.notifyCheckpointComplete(2));
+    original.notifyCheckpointComplete(2);
     int creates = store.creates;
 
-    assertThrows(
-        IllegalStateException.class, () -> PubSubReplaySnapshots.restore(store, 1, second));
+    PubSubReplaySnapshots.restore(store, 1, second);
     assertThat(store.creates).isEqualTo(creates);
     assertThat(store.resources).containsExactly(name(first), name(second));
     store.failedDeletions.clear();
@@ -354,7 +362,151 @@ public class PubSubReplaySnapshotsTest {
     assertThat(store.creates).isEqualTo(creates);
     store.failSeek = false;
     PubSubReplaySnapshots.restore(store, 2, checkpoint);
-    assertThat(store.resources).containsExactly(name(checkpoint));
+    assertThat(store.resources).containsExactlyElementsIn(before);
+  }
+
+  @Test
+  public void failoverToCheckpointSix_preservesAndRestoresSavepointSeven() {
+    PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 2);
+    PubSubEnumeratorCheckpoint six = snapshot(original, 6);
+    original.notifyCheckpointComplete(6);
+    PubSubEnumeratorCheckpoint seven = snapshot(original, 7);
+    PubSubReplaySnapshots.restore(store, 2, six);
+    assertThat(store.resources).contains(name(seven));
+    PubSubReplaySnapshots.restore(store, 2, seven);
+    assertThat(store.seeks).containsExactly(name(six), name(seven)).inOrder();
+  }
+
+  @Test
+  public void deleteFailure_doesNotFailCompletionAndKeepsResourceBudgetBounded() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    PubSubEnumeratorCheckpoint second = snapshot(manager, 2);
+    store.failedDeletions.add(name(first));
+    manager.notifyCheckpointComplete(2);
+    for (int id = 3; id < 20; id++) {
+      assertThat(name(snapshot(manager, id))).isEqualTo(name(second));
+      manager.notifyCheckpointComplete(id);
+      assertThat(store.resources).hasSize(2);
+    }
+    store.failedDeletions.clear();
+    assertThat(name(snapshot(manager, 20))).isNotEqualTo(name(second));
+  }
+
+  @Test
+  public void createFailure_reusesValidBoundarySoCheckpointCanComplete() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    store.failAfterCreate = true;
+    PubSubEnumeratorCheckpoint second = snapshot(manager, 2);
+    assertThat(name(second)).isEqualTo(name(first));
+    manager.notifyCheckpointComplete(2);
+    store.failAfterCreate = false;
+    assertThat(name(snapshot(manager, 3))).isNotEqualTo(name(first));
+  }
+
+  @Test
+  public void expiredBoundary_isNotUsedAsCreateFailureFallback() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    store.expired.add(name(first));
+    store.failAfterCreate = true;
+    assertThrows(IllegalStateException.class, () -> snapshot(manager, 2));
+  }
+
+  @Test
+  public void preservedUnknownSavepoints_cannotGrowPastNamespaceBudgetAcrossRestarts() {
+    PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(original, 1);
+    original.notifyCheckpointComplete(1);
+    PubSubEnumeratorCheckpoint later = snapshot(original, 2);
+    for (int id = 3; id < 30; id++) {
+      PubSubReplaySnapshots recovered = PubSubReplaySnapshots.restore(store, 1, first);
+      assertThat(name(snapshot(recovered, id))).isEqualTo(name(first));
+      recovered.notifyCheckpointComplete(id);
+      assertThat(store.resources).containsExactly(name(first), name(later));
+    }
+  }
+
+  @Test
+  public void failureAndExpiryMetrics_reportQueuedCleanupAndFallbackBoundary() {
+    Map<String, Counter> counters = new HashMap<>();
+    Map<String, Gauge<?>> gauges = new HashMap<>();
+    var group =
+        new UnregisteredMetricsGroup() {
+          @Override
+          public <C extends Counter> C counter(String name, C counter) {
+            counters.put(name, counter);
+            return counter;
+          }
+
+          @Override
+          public <T, G extends Gauge<T>> G gauge(String name, G gauge) {
+            gauges.put(name, gauge);
+            return gauge;
+          }
+        };
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
+    manager.registerMetrics(group);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    PubSubEnumeratorCheckpoint second = snapshot(manager, 2);
+    store.expiries.put(name(second), System.currentTimeMillis() + 60000);
+    store.failedDeletions.add(name(first));
+    manager.notifyCheckpointComplete(2);
+    assertThat(counters.get("snapshotDeleteFailures").getCount()).isEqualTo(1);
+    assertThat(gauges.get("pendingSnapshotDeletions").getValue()).isEqualTo(1);
+    snapshot(manager, 3);
+    long remaining = (Long) gauges.get("replaySnapshotTimeToExpiryMillis").getValue();
+    assertThat(remaining).isGreaterThan(0L);
+    assertThat(remaining).isAtMost(60000L);
+    store.failedDeletions.clear();
+    store.failAfterCreate = true;
+    snapshot(manager, 4);
+    assertThat(counters.get("snapshotCreateFailures").getCount()).isEqualTo(1);
+  }
+
+  @Test
+  public void oldBacklog_failedPreconditionCanReuseBoundaryAndCompleteCheckpoint() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    store.createFailure =
+        new FailedPreconditionException(
+            "Backlog too old for a new snapshot",
+            null,
+            GrpcStatusCode.of(Status.Code.FAILED_PRECONDITION),
+            false);
+    PubSubEnumeratorCheckpoint next = snapshot(manager, 2);
+    assertThat(name(next)).isEqualTo(name(first));
+    manager.notifyCheckpointComplete(2);
+    assertThat(store.resources).containsExactly(name(first));
+  }
+
+  @Test
+  public void oldBacklogWithoutAnyBoundary_failsInsteadOfClaimingReplayProtection() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    store.createFailure =
+        new FailedPreconditionException(
+            "Backlog too old for a new snapshot",
+            null,
+            GrpcStatusCode.of(Status.Code.FAILED_PRECONDITION),
+            false);
+    assertThrows(FailedPreconditionException.class, () -> snapshot(manager, 1));
+    assertThat(store.resources).isEmpty();
+  }
+
+  @Test
+  public void missingBoundary_isNotUsedAsCreateFailureFallback() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    store.resources.remove(name(first));
+    store.createFailure = new IllegalStateException("Create failed");
+    assertThrows(IllegalStateException.class, () -> snapshot(manager, 2));
   }
 
   private static PubSubEnumeratorCheckpoint snapshot(PubSubReplaySnapshots manager, long id) {
@@ -374,7 +526,10 @@ public class PubSubReplaySnapshotsTest {
   private static class MemoryStore implements PubSubReplaySnapshots.Store {
     final Set<String> resources = new LinkedHashSet<>();
     final Set<String> failedDeletions = new HashSet<>();
+    final Set<String> expired = new HashSet<>();
+    final Map<String, Long> expiries = new HashMap<>();
     final List<String> seeks = new ArrayList<>();
+    RuntimeException createFailure;
     boolean failAfterCreate;
     boolean failSeek;
     boolean closed;
@@ -383,6 +538,7 @@ public class PubSubReplaySnapshotsTest {
     @Override
     public String create(String name) {
       creates++;
+      if (createFailure != null) throw createFailure;
       String fullName = fullName(name);
       resources.add(fullName);
       if (failAfterCreate) {
@@ -408,6 +564,11 @@ public class PubSubReplaySnapshotsTest {
         throw new IllegalStateException("Injected delete failure");
       }
       resources.remove(fullName(name));
+    }
+
+    @Override
+    public long expiryMillis(String name) {
+      return expired.contains(name) ? 1 : expiries.getOrDefault(name, Long.MAX_VALUE);
     }
 
     @Override

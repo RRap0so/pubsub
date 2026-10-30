@@ -34,10 +34,13 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /** Administrative Pub/Sub operations used only when replay recovery is explicitly enabled. */
 public final class PubSubSnapshotStore implements PubSubReplaySnapshots.Store {
+  private final Map<String, Long> expiries = new HashMap<>();
   private final String project;
   private final ProjectSubscriptionName subscription;
   private final SubscriptionAdminClient client;
@@ -123,7 +126,9 @@ public final class PubSubSnapshotStore implements PubSubReplaySnapshots.Store {
 
   @Override
   public String create(String name) {
-    return client.createSnapshot(snapshotName(name), subscription).getName();
+    Snapshot snapshot = client.createSnapshot(snapshotName(name), subscription);
+    rememberExpiry(snapshot);
+    return snapshot.getName();
   }
 
   @Override
@@ -142,6 +147,7 @@ public final class PubSubSnapshotStore implements PubSubReplaySnapshots.Store {
     } catch (NotFoundException alreadyGone) {
       // Expired resources have already released their retained backlog.
     }
+    expiries.remove(snapshotName(name).toString());
   }
 
   @Override
@@ -152,6 +158,33 @@ public final class PubSubSnapshotStore implements PubSubReplaySnapshots.Store {
         .iterateAll()
         .forEach(snapshot -> names.add(snapshot.getName()));
     return names;
+  }
+
+  private void rememberExpiry(Snapshot snapshot) {
+    expiries.put(
+        snapshot.getName(),
+        snapshot.hasExpireTime()
+            ? snapshot.getExpireTime().getSeconds() * 1000L
+                + snapshot.getExpireTime().getNanos() / 1_000_000L
+            : Long.MAX_VALUE);
+  }
+
+  @Override
+  public boolean exists(String name) {
+    try {
+      rememberExpiry(client.getSnapshot(snapshotName(name)));
+      return true;
+    } catch (NotFoundException missing) {
+      expiries.put(snapshotName(name).toString(), 0L);
+      return false;
+    }
+  }
+
+  @Override
+  public long expiryMillis(String name) {
+    String fullName = snapshotName(name).toString();
+    if (!expiries.containsKey(fullName)) exists(fullName);
+    return expiries.get(fullName);
   }
 
   private ProjectSnapshotName snapshotName(String name) {

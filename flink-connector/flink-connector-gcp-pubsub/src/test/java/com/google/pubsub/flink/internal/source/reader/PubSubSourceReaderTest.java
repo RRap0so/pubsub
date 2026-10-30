@@ -29,6 +29,8 @@ import com.google.pubsub.flink.internal.source.split.SubscriptionSplitState;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.PubsubMessage;
 import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.configuration.Configuration;
@@ -93,6 +95,35 @@ public class PubSubSourceReaderTest {
       reader.pollNext(output);
     }
     assertThat(output.getEmittedRecords()).containsExactly("message1", "message2");
+  }
+
+  @Test(timeout = 10000)
+  public void restoredSplits_doNotStartPullingUntilCoordinatorReplayIsReady() throws Exception {
+    AtomicInteger subscribers = new AtomicInteger();
+    PubSubSourceReader<String> restored =
+        new PubSubSourceReader<>(
+            PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()),
+            mockAckTracker,
+            tracker -> {
+              subscribers.incrementAndGet();
+              return mockSplitReader;
+            },
+            new Configuration(),
+            mockContext,
+            true);
+    SubscriptionSplit split =
+        SubscriptionSplit.create(ProjectSubscriptionName.of("project", "sub"));
+    try {
+      restored.addSplits(List.of(split));
+      assertThat(subscribers.get()).isEqualTo(0);
+      assertThat(restored.snapshotState(1)).containsExactly(split);
+      restored.handleSourceEvents(PubSubReplayReadyEvent.INSTANCE);
+      assertThat(subscribers.get()).isEqualTo(1);
+      restored.handleSourceEvents(PubSubReplayReadyEvent.INSTANCE);
+      assertThat(subscribers.get()).isEqualTo(1);
+    } finally {
+      restored.close();
+    }
   }
 
   @Test

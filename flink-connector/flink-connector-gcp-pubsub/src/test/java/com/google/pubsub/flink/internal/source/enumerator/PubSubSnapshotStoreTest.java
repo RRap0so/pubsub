@@ -53,6 +53,13 @@ public class PubSubSnapshotStoreTest {
   }
 
   @Test
+  public void missingHistoricalSnapshot_hasNoRemainingLifetime() {
+    when(client.getSnapshot(FIRST)).thenThrow(mock(NotFoundException.class));
+    assertThat(store.expiryMillis(FIRST.toString())).isEqualTo(0L);
+    assertThat(store.exists(FIRST.toString())).isFalse();
+  }
+
+  @Test
   public void listingExcludesSnapshotsOnOtherTopics() {
     stubSubscription();
     var response = mock(SubscriptionAdminClient.ListSnapshotsPagedResponse.class);

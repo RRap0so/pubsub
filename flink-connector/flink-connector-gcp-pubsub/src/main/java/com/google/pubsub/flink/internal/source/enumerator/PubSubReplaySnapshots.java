@@ -18,6 +18,7 @@ package com.google.pubsub.flink.internal.source.enumerator;
 import com.google.common.base.Preconditions;
 import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -25,9 +26,15 @@ import java.util.NavigableMap;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.ThreadSafeSimpleCounter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Coordinator-owned replay snapshots. All methods run on the enumerator thread. */
 public final class PubSubReplaySnapshots implements AutoCloseable {
+  private static final Logger LOG = LoggerFactory.getLogger(PubSubReplaySnapshots.class);
+
   public interface Store extends AutoCloseable {
     String create(String name);
 
@@ -36,6 +43,17 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
     void delete(String name);
 
     Iterable<String> list();
+
+    default boolean exists(String name) {
+      for (String existing : list()) {
+        if (existing.equals(name) || existing.endsWith("/" + name)) return true;
+      }
+      return false;
+    }
+
+    default long expiryMillis(String name) {
+      return Long.MAX_VALUE;
+    }
 
     @Override
     void close();
@@ -49,7 +67,10 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
   // stable across repeated snapshot calls and until every dependent checkpoint is finalized.
   private final NavigableMap<Long, Long> checkpointSnapshots = new TreeMap<>();
   // Keep failed deletions until successful; never silently forget a leaked resource.
-  private final Set<String> deletions = new LinkedHashSet<>();
+  private final Set<String> deletions = Collections.synchronizedSet(new LinkedHashSet<>());
+  private final ThreadSafeSimpleCounter deleteFailures = new ThreadSafeSimpleCounter();
+  private final ThreadSafeSimpleCounter createFailures = new ThreadSafeSimpleCounter();
+  private volatile long selectedExpiryMillis;
   private long completedCheckpoint = Long.MIN_VALUE;
 
   public PubSubReplaySnapshots(Store store, int retentionCount) {
@@ -68,7 +89,6 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
     Preconditions.checkArgument(
         namespace.matches("[0-9a-f]{32}"), "Invalid replay snapshot namespace");
     PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, retentionCount, namespace);
-    manager.reconcileNamespace();
     return manager;
   }
 
@@ -95,25 +115,61 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
     store.seek(target);
     manager.completedCheckpoint = checkpoint.getReplayCheckpointId();
     manager.pruneCompletedSnapshots();
-    // Reconcile before creating new resources, including after repeated restarts following a
-    // deletion failure. The selected restore boundary remains protected throughout cleanup.
-    manager.reconcileNamespace();
+    // Unreferenced snapshots may belong to completed newer savepoints. Never infer that they
+    // are uncommitted from an older checkpoint; leave them for expiry or explicit reviewed cleanup.
+    manager.deleteQueuedSnapshots();
+    manager.selectedExpiryMillis = store.expiryMillis(target);
+    Preconditions.checkState(
+        manager.selectedExpiryMillis > System.currentTimeMillis(),
+        "Selected restore boundary is missing or expired");
     return manager;
   }
 
-  private void reconcileNamespace() {
-    Set<String> referenced = new HashSet<>(snapshots.values());
+  public void registerMetrics(MetricGroup group) {
+    group.counter("snapshotDeleteFailures", deleteFailures);
+    group.counter("snapshotCreateFailures", createFailures);
+    group.gauge("pendingSnapshotDeletions", () -> deletions.size());
+    group.gauge(
+        "replaySnapshotTimeToExpiryMillis",
+        () ->
+            selectedExpiryMillis == 0
+                ? 0L
+                : Math.max(0L, selectedExpiryMillis - System.currentTimeMillis()));
+  }
+
+  private static String shortName(String name) {
+    return name.substring(name.lastIndexOf('/') + 1);
+  }
+
+  private boolean withinResourceBudget() {
+    Set<String> resources = new HashSet<>();
+    for (String name : snapshots.values()) resources.add(shortName(name));
+    for (String name : deletions) resources.add(shortName(name));
     String prefix = "flink-" + namespace + "-";
     for (String name : store.list()) {
-      String shortName = name.substring(name.lastIndexOf('/') + 1);
-      if (shortName.startsWith(prefix) && !referenced.contains(name)) {
-        deletions.add(name);
-      }
+      if (shortName(name).startsWith(prefix)) resources.add(shortName(name));
     }
-    deleteQueuedSnapshots();
+    return (long) resources.size() < (long) retentionCount + 1;
+  }
+
+  private long reusableBoundary(long checkpointId) {
+    Map.Entry<Long, String> boundary = snapshots.floorEntry(checkpointId);
+    Preconditions.checkState(boundary != null, "No valid replay boundary is available");
+    Preconditions.checkState(
+        store.exists(boundary.getValue())
+            && store.expiryMillis(boundary.getValue()) > System.currentTimeMillis(),
+        "The replay boundary has expired; cannot safely complete a checkpoint");
+    return boundary.getKey();
   }
 
   public void snapshot(long checkpointId, PubSubEnumeratorCheckpoint.Builder checkpoint) {
+    deleteQueuedSnapshots();
+    for (var entry : new ArrayList<>(snapshots.entrySet())) {
+      if (store.expiryMillis(entry.getValue()) <= System.currentTimeMillis()) {
+        snapshots.remove(entry.getKey());
+        deletions.add(entry.getValue());
+      }
+    }
     deleteQueuedSnapshots();
     Long replayCheckpointId = checkpointSnapshots.get(checkpointId);
     if (replayCheckpointId == null) {
@@ -129,22 +185,34 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
           Preconditions.checkArgument(
               replayCheckpointId <= checkpointId, "Cannot use a future replay boundary");
         } else {
-          Preconditions.checkState(
-              (long) snapshots.size() < (long) retentionCount + 1,
-              "Replay snapshot retention invariant violated");
-          String name = "flink-" + namespace + "-" + UUID.randomUUID().toString().replace("-", "");
-          try {
-            name = store.create(name);
-          } catch (RuntimeException failure) {
-            // A failed create RPC may have succeeded remotely. Retry cleanup before making more.
-            deletions.add(name);
-            throw failure;
+          if (!withinResourceBudget()) {
+            replayCheckpointId = reusableBoundary(checkpointId);
+          } else {
+            String name =
+                "flink-" + namespace + "-" + UUID.randomUUID().toString().replace("-", "");
+            try {
+              name = store.create(name);
+            } catch (RuntimeException failure) {
+              // A failed create RPC may have succeeded remotely. Retry cleanup before making more.
+              deletions.add(name);
+              createFailures.inc();
+              LOG.warn(
+                  "Could not create replay snapshot; reusing an earlier valid boundary if"
+                      + " available",
+                  failure);
+              if (snapshots.isEmpty()) throw failure;
+              replayCheckpointId = reusableBoundary(checkpointId);
+              name = null;
+            }
+            if (name != null) snapshots.put(checkpointId, name);
           }
-          snapshots.put(checkpointId, name);
         }
       }
       checkpointSnapshots.put(checkpointId, replayCheckpointId);
     }
+    Preconditions.checkState(
+        snapshots.containsKey(replayCheckpointId), "Selected replay boundary expired");
+    selectedExpiryMillis = store.expiryMillis(snapshots.get(replayCheckpointId));
     checkpoint.setReplaySnapshotNamespace(namespace).setReplayCheckpointId(replayCheckpointId);
     for (Map.Entry<Long, String> entry : snapshots.headMap(replayCheckpointId, true).entrySet()) {
       checkpoint.addReplaySnapshots(
@@ -185,8 +253,13 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
 
   private void deleteQueuedSnapshots() {
     for (String name : new ArrayList<>(deletions)) {
-      store.delete(name);
-      deletions.remove(name);
+      try {
+        store.delete(name);
+        deletions.remove(name);
+      } catch (RuntimeException failure) {
+        deleteFailures.inc();
+        LOG.warn("Replay snapshot deletion will be retried: {}", name, failure);
+      }
     }
   }
 

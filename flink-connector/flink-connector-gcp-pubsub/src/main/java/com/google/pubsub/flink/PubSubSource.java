@@ -192,7 +192,8 @@ public abstract class PubSubSource<OutputT>
         new PubSubAckTracker(metrics),
         ackTracker -> createSplitReader(ackTracker, acknowledgementMetrics),
         new Configuration(),
-        readerContext);
+        readerContext,
+        replaySnapshotRetentionCount().isPresent());
   }
 
   @Override
