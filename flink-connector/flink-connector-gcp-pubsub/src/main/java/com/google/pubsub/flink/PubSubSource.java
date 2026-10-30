@@ -94,9 +94,12 @@ public abstract class PubSubSource<OutputT>
 
   abstract String replaySnapshotNamespace();
 
+  abstract boolean replayDeduplicationRequired();
+
   public static <OutputT> Builder<OutputT> builder() {
     return new AutoValue_PubSubSource.Builder<OutputT>()
-        .setReplaySnapshotNamespace(UUID.randomUUID().toString().replace("-", ""));
+        .setReplaySnapshotNamespace(UUID.randomUUID().toString().replace("-", ""))
+        .setReplayDeduplicationRequired(false);
   }
 
   Subscriber createSubscriber(MessageReceiver receiver) {
@@ -181,13 +184,17 @@ public abstract class PubSubSource<OutputT>
         ProjectSubscriptionName.of(projectName(), subscriptionName()),
         enumContext,
         new HashMap<Integer, SubscriptionSplit>(),
-        createReplaySnapshots(null));
+        createReplaySnapshots(null),
+        replayDeduplicationRequired());
   }
 
   @Override
   public SplitEnumerator<SubscriptionSplit, PubSubEnumeratorCheckpoint> restoreEnumerator(
       SplitEnumeratorContext<SubscriptionSplit> enumContext,
       PubSubEnumeratorCheckpoint checkpoint) {
+    Preconditions.checkState(
+        checkpoint.getReplayDeduplicationRequired() == replayDeduplicationRequired(),
+        "Replay deduplication cannot be enabled or disabled when restoring an existing checkpoint");
     Preconditions.checkState(
         replaySnapshotRetentionCount().isPresent()
             || checkpoint.getReplaySnapshotNamespace().isEmpty(),
@@ -210,7 +217,8 @@ public abstract class PubSubSource<OutputT>
         ProjectSubscriptionName.of(projectName(), subscriptionName()),
         enumContext,
         assignments,
-        createReplaySnapshots(checkpoint));
+        createReplaySnapshots(checkpoint),
+        replayDeduplicationRequired());
   }
 
   private PubSubReplaySnapshots createReplaySnapshots(PubSubEnumeratorCheckpoint checkpoint) {
@@ -336,6 +344,8 @@ public abstract class PubSubSource<OutputT>
     public abstract Builder<OutputT> setReplaySnapshotRetentionCount(Integer count);
 
     abstract Builder<OutputT> setReplaySnapshotNamespace(String namespace);
+
+    abstract Builder<OutputT> setReplayDeduplicationRequired(boolean required);
 
     abstract PubSubSource<OutputT> autoBuild();
 

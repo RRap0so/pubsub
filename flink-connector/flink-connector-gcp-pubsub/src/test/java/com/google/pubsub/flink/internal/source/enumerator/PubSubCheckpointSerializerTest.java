@@ -50,9 +50,26 @@ public final class PubSubCheckpointSerializerTest {
   }
 
   @Test
+  public void deserialize_readsVersionOneAndPreservesDeduplicationModeInVersionTwo()
+      throws Exception {
+    PubSubCheckpointSerializer serializer = new PubSubCheckpointSerializer();
+    assertThat(
+            serializer
+                .deserialize(1, PubSubEnumeratorCheckpoint.getDefaultInstance().toByteArray())
+                .getReplayDeduplicationRequired())
+        .isFalse();
+    PubSubEnumeratorCheckpoint protectedCheckpoint =
+        PubSubEnumeratorCheckpoint.newBuilder().setReplayDeduplicationRequired(true).build();
+    assertThat(
+            serializer.deserialize(
+                serializer.getVersion(), serializer.serialize(protectedCheckpoint)))
+        .isEqualTo(protectedCheckpoint);
+  }
+
+  @Test
   public void deserialize_rejectsUnknownVersion() {
     assertThrows(
         java.io.IOException.class,
-        () -> new PubSubCheckpointSerializer().deserialize(2, new byte[0]));
+        () -> new PubSubCheckpointSerializer().deserialize(3, new byte[0]));
   }
 }

@@ -42,4 +42,6 @@ message PubSubEnumeratorCheckpoint {
   }
   repeated ReplaySnapshot replay_snapshots = 4;
   string replay_subscription = 5;
+  // Prevent restoring without the checkpointed message-ID index, or adding an empty index.
+  bool replay_deduplication_required = 6;
 }

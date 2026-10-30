@@ -38,18 +38,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.state.CheckpointListener;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.execution.CheckpointType;
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.metrics.Counter;
 import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.runtime.testutils.InMemoryReporter;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -67,6 +72,7 @@ import org.junit.rules.TemporaryFolder;
 /** Recovery scenarios with actual Flink jobs, checkpoints and managed operator state. */
 public class PubSubRecoveryIT {
   private static MiniClusterWithClientResource cluster;
+  private static InMemoryReporter metrics;
   private static final Map<String, List<String>> OUTPUT = new ConcurrentHashMap<>();
   private static final Map<String, String> COMPLETED = new ConcurrentHashMap<>();
   private static final Map<String, AtomicBoolean> FAIL_B_ONCE = new ConcurrentHashMap<>();
@@ -87,6 +93,8 @@ public class PubSubRecoveryIT {
     config.setString("rest.bind-address", "127.0.0.1");
     config.setString("rest.address", "127.0.0.1");
     config.setString("rest.bind-port", "0");
+    metrics = InMemoryReporter.create();
+    metrics.addToConfiguration(config);
     cluster =
         new MiniClusterWithClientResource(
             new MiniClusterResourceConfiguration.Builder()
@@ -99,8 +107,14 @@ public class PubSubRecoveryIT {
 
   @AfterClass
   public static void stopCluster() {
-    if (cluster != null) {
-      cluster.after();
+    try {
+      if (cluster != null) {
+        cluster.after();
+      }
+    } finally {
+      if (metrics != null) {
+        metrics.close();
+      }
     }
   }
 
@@ -232,12 +246,129 @@ public class PubSubRecoveryIT {
     assertEquals(List.of("A|A,A"), OUTPUT.get(secondRun));
   }
 
+  @Test(timeout = 90000)
+  public void replayDeduplication_keepsRestoredBusinessStateFromDoubleCounting() throws Exception {
+    verifyDeduplication(1);
+  }
+
+  @Test(timeout = 90000)
+  public void replayDeduplication_keepsBusinessStateCorrectAfterRescaling() throws Exception {
+    verifyDeduplication(2);
+  }
+
+  @Test(timeout = 90000)
+  public void replayDeduplication_taskFailureRollsBackIdsTogetherWithBusinessState()
+      throws Exception {
+    String run = runId();
+    JobClient job = startJob(run, null, false, 2, 2, true);
+    publish("A");
+    await(() -> OUTPUT.get(run).contains("A|A"), "A processed");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(job.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    FAIL_B_ONCE.put(run, new AtomicBoolean(true));
+    publish("B");
+    await(() -> OUTPUT.get(run).contains("B|A,B"), "failed B retried after ID state rollback");
+    assertEquals(false, FAIL_B_ONCE.get(run).get());
+    assertEquals(List.of("A|A", "B|A,B"), OUTPUT.get(run));
+  }
+
+  private void verifyDeduplication(int restoredParallelism) throws Exception {
+    String firstRun = runId();
+    JobClient original = startJob(firstRun, null, false, 2, 1, true);
+    publish("A");
+    await(() -> OUTPUT.get(firstRun).contains("A|A"), "A accepted before snapshot");
+    // A is represented in Flink state but is still unacknowledged in this provider snapshot.
+    String savepoint =
+        original
+            .triggerSavepoint(savepointDir(), SavepointFormatType.CANONICAL)
+            .get(20, TimeUnit.SECONDS);
+    publish("B");
+    await(() -> OUTPUT.get(firstRun).contains("B|A,B"), "B processed after the savepoint");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cancel(original);
+    assertSubscriptionDrained();
+
+    String secondRun = runId();
+    JobClient restored = startJob(secondRun, savepoint, false, 2, restoredParallelism, true);
+    publish("C");
+    await(() -> OUTPUT.get(secondRun).size() >= 2, "acknowledged B replayed alongside new C");
+    await(() -> duplicateDrops(restored) >= 1, "replayed A observed and filtered by the ID index");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(restored.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cancel(restored);
+    assertSubscriptionDrained();
+    List<String> output = OUTPUT.get(secondRun);
+    assertEquals(2, output.size());
+    assertEquals(
+        java.util.Set.of("B", "C"),
+        output.stream()
+            .map(value -> value.split("\\|", 2)[0])
+            .collect(java.util.stream.Collectors.toSet()));
+    String lastState = output.get(output.size() - 1).split("\\|", 2)[1];
+    assertEquals(3, lastState.split(",").length);
+    assertEquals(
+        java.util.Set.of("A", "B", "C"),
+        java.util.Set.copyOf(java.util.Arrays.asList(lastState.split(","))));
+  }
+
+  private long duplicateDrops(JobClient job) {
+    return metrics.findMetrics(job.getJobID(), ".*pubsubReplayDuplicatesDropped").values().stream()
+        .mapToLong(metric -> ((Counter) metric).getCount())
+        .sum();
+  }
+
+  public static class KeyedSessionAccumulator extends RichMapFunction<String, String> {
+    private final String run;
+    private transient ValueState<String> session;
+
+    public KeyedSessionAccumulator(String run) {
+      this.run = run;
+    }
+
+    @Override
+    public void open(OpenContext context) throws Exception {
+      session = getRuntimeContext().getState(new ValueStateDescriptor<>("session", Types.STRING));
+    }
+
+    @Override
+    public String map(String value) throws Exception {
+      AtomicBoolean fail = FAIL_B_ONCE.get(run);
+      if (value.equals("B") && fail != null && fail.compareAndSet(true, false)) {
+        throw new RuntimeException("Injected recovery failure before processing B");
+      }
+      String previous = session.value();
+      String next = previous == null ? value : previous + "," + value;
+      session.update(next);
+      String result = value + "|" + next;
+      OUTPUT.get(run).add(result);
+      return result;
+    }
+  }
+
   private JobClient startJob(String run, String savepoint, boolean checkpointing) throws Exception {
     return startJob(run, savepoint, checkpointing, 0, 1);
   }
 
   private JobClient startJob(
       String run, String savepoint, boolean checkpointing, int replayRetention, int parallelism)
+      throws Exception {
+    return startJob(run, savepoint, checkpointing, replayRetention, parallelism, false);
+  }
+
+  private JobClient startJob(
+      String run,
+      String savepoint,
+      boolean checkpointing,
+      int replayRetention,
+      int parallelism,
+      boolean deduplicate)
       throws Exception {
     Configuration config = new Configuration();
     config.setString("restart-strategy.type", "fixed-delay");
@@ -248,7 +379,7 @@ public class PubSubRecoveryIT {
     }
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(config);
     env.setParallelism(parallelism);
-    env.setMaxParallelism(parallelism);
+    env.setMaxParallelism(16);
     if (checkpointing) {
       env.enableCheckpointing(200);
     } else {
@@ -266,13 +397,24 @@ public class PubSubRecoveryIT {
     if (replayRetention > 0) {
       source.setReplaySnapshotRetentionCount(replayRetention);
     }
-    env.fromSource(source.build(), WatermarkStrategy.noWatermarks(), "pubsub")
-        .uid("pubsub")
-        .map(new SessionAccumulator(run))
-        .uid("session-state")
-        .returns(Types.STRING)
-        .sinkTo(new DiscardingSink<>())
-        .uid("discard");
+    if (deduplicate) {
+      PubSubReplayDeduplication.read(
+              env, source.build(), WatermarkStrategy.noWatermarks(), "pubsub", Duration.ofDays(8))
+          .keyBy(value -> "session")
+          .map(new KeyedSessionAccumulator(run))
+          .uid("session-state")
+          .returns(Types.STRING)
+          .sinkTo(new DiscardingSink<>())
+          .uid("discard");
+    } else {
+      env.fromSource(source.build(), WatermarkStrategy.noWatermarks(), "pubsub")
+          .uid("pubsub")
+          .map(new SessionAccumulator(run))
+          .uid("session-state")
+          .returns(Types.STRING)
+          .sinkTo(new DiscardingSink<>())
+          .uid("discard");
+    }
     JobClient job = env.executeAsync("pubsub-repro-" + run);
     jobs.add(job);
     return job;
