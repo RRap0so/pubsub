@@ -651,14 +651,14 @@ public class PubSubReplaySnapshotsTest {
   }
 
   @Test
-  public void reviewedOfflineCleanupAndRestart_refreshesNamespaceBudget() {
+  public void coordinatorRestart_refreshesInventoryAfterExternalDeletion() {
     PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 1);
     PubSubEnumeratorCheckpoint first = snapshot(original, 1);
     original.notifyCheckpointComplete(1);
     PubSubEnumeratorCheckpoint newer = snapshot(original, 2);
     PubSubReplaySnapshots recovered = PubSubReplaySnapshots.restore(store, 1, first);
     assertThat(name(snapshot(recovered, 3))).isEqualTo(name(first));
-    // The operator stops the coordinator, abandons the newer recovery point, and reviews cleanup.
+    // Model an external deletion while the coordinator is stopped.
     recovered.close();
     store.delete(name(newer));
     int listsBeforeRestart = store.listCalls;

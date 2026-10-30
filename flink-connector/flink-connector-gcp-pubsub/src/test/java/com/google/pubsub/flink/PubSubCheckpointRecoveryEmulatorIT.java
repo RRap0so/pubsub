@@ -172,7 +172,13 @@ public class PubSubCheckpointRecoveryEmulatorIT {
       }
       verify(recovered, times(1)).list();
       // This local test owns the namespace and no recovery point is retained after completion.
-      for (String name : recovered.listForSubscriptionTopic()) recovered.delete(name);
+      String prefix =
+          "projects/checkpoint-repro/snapshots/flink-"
+              + checkpoint.getReplaySnapshotNamespace()
+              + "-";
+      for (String name : recovered.list()) {
+        if (name.startsWith(prefix)) recovered.delete(name);
+      }
     }
   }
 

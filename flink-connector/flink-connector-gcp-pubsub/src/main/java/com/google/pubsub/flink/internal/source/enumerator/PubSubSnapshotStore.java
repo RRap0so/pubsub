@@ -87,43 +87,6 @@ public final class PubSubSnapshotStore implements PubSubReplaySnapshots.Store {
     this.channel = null;
   }
 
-  /** Lists only snapshots on the configured subscription's topic. Does not modify resources. */
-  public List<String> listForSubscriptionTopic() {
-    String topic = client.getSubscription(subscription).getTopic();
-    List<String> names = new ArrayList<>();
-    client
-        .listSnapshots("projects/" + project)
-        .iterateAll()
-        .forEach(
-            snapshot -> {
-              if (snapshot.getTopic().equals(topic)) {
-                names.add(snapshot.getName());
-              }
-            });
-    return names;
-  }
-
-  /** Validates the entire explicit deletion list before deleting any snapshot. */
-  public void deleteForSubscriptionTopic(List<String> names) {
-    List<ProjectSnapshotName> parsed = new ArrayList<>();
-    for (String name : names) {
-      parsed.add(snapshotName(name));
-    }
-    String topic = client.getSubscription(subscription).getTopic();
-    for (ProjectSnapshotName name : parsed) {
-      try {
-        Snapshot snapshot = client.getSnapshot(name);
-        Preconditions.checkArgument(
-            snapshot.getTopic().equals(topic), "Replay snapshot belongs to a different topic");
-      } catch (NotFoundException alreadyGone) {
-        // Expiration or a prior cleanup may already have removed this reviewed resource.
-      }
-    }
-    for (ProjectSnapshotName name : parsed) {
-      delete(name.toString());
-    }
-  }
-
   @Override
   public String create(String name) {
     Snapshot snapshot = client.createSnapshot(snapshotName(name), subscription);

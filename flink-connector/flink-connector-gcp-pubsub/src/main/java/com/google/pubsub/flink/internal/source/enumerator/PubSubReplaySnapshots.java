@@ -136,7 +136,7 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
     manager.completedCheckpoint = checkpoint.getReplayCheckpointId();
     manager.pruneCompletedSnapshots();
     // Unreferenced snapshots may belong to completed newer savepoints. Never infer that they
-    // are uncommitted from an older checkpoint; leave them for expiry or explicit reviewed cleanup.
+    // are uncommitted from an older checkpoint; leave them for provider expiry.
     manager.deleteQueuedSnapshots();
     manager.selectedExpiryMillis = store.expiryMillis(target);
     Preconditions.checkState(
