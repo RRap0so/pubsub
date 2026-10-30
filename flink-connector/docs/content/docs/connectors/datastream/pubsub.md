@@ -142,10 +142,12 @@ to that snapshot before assigning readers. Missing or expired snapshots fail
 recovery rather than silently skipping input.
 
 This option is disabled by default and requires a dedicated subscription and
-snapshot administration permissions. It retains the last `count` snapshot
-boundaries at or before the newest completed checkpoint, plus in-flight ones.
-New boundaries fail once `count + 1` snapshots are tracked; use one concurrent
-checkpoint and complete checkpoints between manual savepoints.
+snapshot administration permissions. It retains the last `count` provider
+snapshot boundaries at or before the newest completed checkpoint, plus one shared
+pending boundary. Checkpoints and savepoints can reference the same earlier
+snapshot while completion is pending, including when a savepoint has no completion
+notification. This keeps provider snapshots bounded by `count + 1` without blocking
+the next checkpoint. Recovery from a shared boundary may replay additional input.
 Older savepoints outside this window cannot be restored. Pub/Sub bills retained
 snapshot data separately; snapshots survive job shutdown and abandoned jobs
 require independent cleanup. Replay can duplicate records already represented
@@ -280,7 +282,7 @@ redelivered by Google Cloud Pub/Sub.
     <tr>
         <td>setReplaySnapshotRetentionCount(Integer count)</td>
         <td>(disabled)</td>
-        <td>Enables checkpoint-coordinated replay snapshots. Retains the most recent count snapshot boundaries at or before the newest completed checkpoint, plus in-flight boundaries. Requires count &gt; 0, snapshot permissions, and a dedicated subscription. Snapshot storage is billed separately; replay remains at least once.</td>
+        <td>Enables checkpoint-coordinated replay snapshots. Retains the most recent count completed provider boundaries plus one shared pending boundary, bounded by count + 1 provider snapshots. Requires count &gt; 0, snapshot permissions, and a dedicated subscription. Snapshot storage is billed separately; replay remains at least once.</td>
     </tr>
   </tbody>
 </table>

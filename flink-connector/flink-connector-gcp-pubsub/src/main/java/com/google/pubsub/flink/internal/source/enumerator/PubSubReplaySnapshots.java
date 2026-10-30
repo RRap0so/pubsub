@@ -45,6 +45,9 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
   private final int retentionCount;
   private final String namespace;
   private final NavigableMap<Long, String> snapshots = new TreeMap<>();
+  // Flink checkpoint IDs can share an earlier provider boundary. Keep each pending selection
+  // stable across repeated snapshot calls and until every dependent checkpoint is finalized.
+  private final NavigableMap<Long, Long> checkpointSnapshots = new TreeMap<>();
   // Keep failed deletions until successful; never silently forget a leaked resource.
   private final Set<String> deletions = new LinkedHashSet<>();
   private long completedCheckpoint = Long.MIN_VALUE;
@@ -112,24 +115,38 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
 
   public void snapshot(long checkpointId, PubSubEnumeratorCheckpoint.Builder checkpoint) {
     deleteQueuedSnapshots();
-    String name = snapshots.get(checkpointId);
-    if (name == null) {
-      Preconditions.checkState(
-          (long) snapshots.size() < (long) retentionCount + 1,
-          "Replay snapshot limit reached; complete a checkpoint before creating another boundary. "
-              + "Use one concurrent checkpoint and increase replay retention if needed.");
-      name = "flink-" + namespace + "-" + UUID.randomUUID().toString().replace("-", "");
-      try {
-        name = store.create(name);
-      } catch (RuntimeException failure) {
-        // A failed create RPC may have succeeded remotely. Retry cleanup before making more.
-        deletions.add(name);
-        throw failure;
+    Long replayCheckpointId = checkpointSnapshots.get(checkpointId);
+    if (replayCheckpointId == null) {
+      replayCheckpointId = checkpointId;
+      if (!snapshots.containsKey(checkpointId)) {
+        Preconditions.checkState(
+            checkpointId > completedCheckpoint, "Cannot recreate a finalized replay boundary");
+        if (!snapshots.isEmpty() && snapshots.lastKey() > completedCheckpoint) {
+          // A savepoint may complete without a completion notification. Reuse its earlier
+          // boundary so the next checkpoint can finish without allocating another snapshot.
+          // The snapshot predates both cuts; recovery may replay extra data, never skip input.
+          replayCheckpointId = snapshots.lastKey();
+          Preconditions.checkArgument(
+              replayCheckpointId <= checkpointId, "Cannot use a future replay boundary");
+        } else {
+          Preconditions.checkState(
+              (long) snapshots.size() < (long) retentionCount + 1,
+              "Replay snapshot retention invariant violated");
+          String name = "flink-" + namespace + "-" + UUID.randomUUID().toString().replace("-", "");
+          try {
+            name = store.create(name);
+          } catch (RuntimeException failure) {
+            // A failed create RPC may have succeeded remotely. Retry cleanup before making more.
+            deletions.add(name);
+            throw failure;
+          }
+          snapshots.put(checkpointId, name);
+        }
       }
-      snapshots.put(checkpointId, name);
+      checkpointSnapshots.put(checkpointId, replayCheckpointId);
     }
-    checkpoint.setReplaySnapshotNamespace(namespace).setReplayCheckpointId(checkpointId);
-    for (Map.Entry<Long, String> entry : snapshots.headMap(checkpointId, true).entrySet()) {
+    checkpoint.setReplaySnapshotNamespace(namespace).setReplayCheckpointId(replayCheckpointId);
+    for (Map.Entry<Long, String> entry : snapshots.headMap(replayCheckpointId, true).entrySet()) {
       checkpoint.addReplaySnapshots(
           PubSubEnumeratorCheckpoint.ReplaySnapshot.newBuilder()
               .setCheckpointId(entry.getKey())
@@ -139,25 +156,29 @@ public final class PubSubReplaySnapshots implements AutoCloseable {
 
   public void notifyCheckpointComplete(long checkpointId) {
     completedCheckpoint = Math.max(completedCheckpoint, checkpointId);
+    checkpointSnapshots.headMap(completedCheckpoint, true).clear();
     pruneCompletedSnapshots();
     deleteQueuedSnapshots();
   }
 
   private void pruneCompletedSnapshots() {
     // A checkpoint/savepoint may have no completion callback of its own. Keep the last N
-    // snapshot boundaries at or before the newest completed checkpoint, plus all in-flight ones.
+    // provider boundaries at or before the newest completed checkpoint, plus one shared pending
+    // one.
     while (snapshots.headMap(completedCheckpoint, true).size() > retentionCount) {
       deletions.add(snapshots.pollFirstEntry().getValue());
     }
   }
 
   public void notifyCheckpointAborted(long checkpointId) {
-    if (checkpointId == completedCheckpoint) {
-      return;
-    }
-    String name = snapshots.remove(checkpointId);
-    if (name != null) {
-      deletions.add(name);
+    Long replayCheckpointId = checkpointSnapshots.remove(checkpointId);
+    if (replayCheckpointId != null
+        && replayCheckpointId > completedCheckpoint
+        && !checkpointSnapshots.containsValue(replayCheckpointId)) {
+      String name = snapshots.remove(replayCheckpointId);
+      if (name != null) {
+        deletions.add(name);
+      }
     }
     deleteQueuedSnapshots();
   }

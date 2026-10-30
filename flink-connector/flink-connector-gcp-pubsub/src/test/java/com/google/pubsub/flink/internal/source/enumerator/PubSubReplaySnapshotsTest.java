@@ -67,35 +67,40 @@ public class PubSubReplaySnapshotsTest {
   }
 
   @Test
-  public void completion_retainsLatestCompletedAndAllInFlightBoundaries() {
+  public void completion_retainsLatestCompletedAndSharedPendingBoundary() {
     PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
     PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
     manager.notifyCheckpointComplete(1);
     PubSubEnumeratorCheckpoint second = snapshot(manager, 2);
-    assertThrows(IllegalStateException.class, () -> snapshot(manager, 3));
+    PubSubEnumeratorCheckpoint third = snapshot(manager, 3);
+    assertThat(name(third)).isEqualTo(name(second));
     assertThat(store.resources).containsExactly(name(first), name(second));
     manager.notifyCheckpointComplete(2);
-    PubSubEnumeratorCheckpoint third = snapshot(manager, 3);
-    assertThat(store.resources).containsExactly(name(second), name(third));
+    assertThat(name(snapshot(manager, 3))).isEqualTo(name(third));
+    PubSubEnumeratorCheckpoint fourth = snapshot(manager, 4);
+    assertThat(store.resources).containsExactly(name(second), name(fourth));
     manager.notifyCheckpointComplete(
         1); // Late notification must not regress the protected boundary.
-    assertThat(store.resources).containsExactly(name(second), name(third));
-    manager.notifyCheckpointComplete(3);
-    assertThat(store.resources).containsExactly(name(third));
+    assertThat(store.resources).containsExactly(name(second), name(fourth));
+    manager.notifyCheckpointComplete(4);
+    assertThat(store.resources).containsExactly(name(fourth));
   }
 
   @Test
-  public void incompleteBoundaries_hardLimitBlocksAdditionalCreates() {
+  public void incompleteCheckpoints_shareOneBoundaryWithoutAdditionalCreates() {
     PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
-    snapshot(manager, 1);
-    snapshot(manager, 2);
-    snapshot(manager, 3);
-    assertThrows(IllegalStateException.class, () -> snapshot(manager, 4));
-    assertThat(store.creates).isEqualTo(3);
-    assertThat(store.resources).hasSize(3);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    assertThat(name(snapshot(manager, 2))).isEqualTo(name(first));
+    assertThat(name(snapshot(manager, 3))).isEqualTo(name(first));
+    PubSubEnumeratorCheckpoint fourth = snapshot(manager, 4);
+    assertThat(name(fourth)).isEqualTo(name(first));
+    assertThat(store.creates).isEqualTo(1);
+    assertThat(store.resources).containsExactly(name(first));
     manager.notifyCheckpointComplete(3);
-    snapshot(manager, 4);
-    assertThat(store.resources).hasSize(3);
+    assertThat(snapshot(manager, 4)).isEqualTo(fourth);
+    PubSubEnumeratorCheckpoint fifth = snapshot(manager, 5);
+    assertThat(store.resources).containsExactly(name(first), name(fifth));
+    assertThat(store.creates).isEqualTo(2);
   }
 
   @Test
@@ -112,12 +117,116 @@ public class PubSubReplaySnapshotsTest {
   @Test
   public void completion_preservesIntermediateSavepointWithinRetentionWindow() {
     PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
-    snapshot(manager, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
     manager.notifyCheckpointComplete(1);
     PubSubEnumeratorCheckpoint savepoint = snapshot(manager, 2); // No completion notification.
     PubSubEnumeratorCheckpoint next = snapshot(manager, 3);
+    assertThat(name(next)).isEqualTo(name(savepoint));
     manager.notifyCheckpointComplete(3);
-    assertThat(store.resources).containsExactly(name(savepoint), name(next));
+    assertThat(store.resources).containsExactly(name(first), name(savepoint));
+  }
+
+  @Test
+  public void fullRetentionWindow_savepointWithoutCompletionDoesNotBlockNextCheckpoint() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    snapshot(manager, 2);
+    manager.notifyCheckpointComplete(2);
+    snapshot(manager, 3); // A completed savepoint need not send a completion notification.
+
+    // The next periodic checkpoint must be able to complete and advance retention. Otherwise
+    // every future checkpoint hits the capacity guard, so ACK-on-checkpoint input stalls forever.
+    PubSubEnumeratorCheckpoint next = snapshot(manager, 4);
+
+    assertThat(store.resources.size()).isAtMost(3);
+    manager.notifyCheckpointComplete(4);
+    assertThat(store.resources).contains(name(next));
+    assertThat(store.resources.size()).isAtMost(2);
+    PubSubReplaySnapshots.restore(store, 2, next);
+    assertThat(store.seeks).containsExactly(name(next));
+  }
+
+  @Test
+  public void manyUnnotifiedSavepoints_keepStorageBoundedAndAllowCheckpointCompletion()
+      throws Exception {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    snapshot(manager, 2);
+    manager.notifyCheckpointComplete(2);
+    PubSubEnumeratorCheckpoint savepoint = snapshot(manager, 3);
+    PubSubEnumeratorCheckpoint next = savepoint;
+    for (long id = 4; id <= 100; id++) {
+      next = snapshot(manager, id);
+      assertThat(name(next)).isEqualTo(name(savepoint));
+      assertThat(store.resources).hasSize(3);
+    }
+    assertThat(store.creates).isEqualTo(3);
+    manager.notifyCheckpointComplete(100);
+    assertThat(store.resources).hasSize(2);
+    PubSubCheckpointSerializer serializer = new PubSubCheckpointSerializer();
+    PubSubReplaySnapshots restored =
+        PubSubReplaySnapshots.restore(
+            store, 2, serializer.deserialize(serializer.getVersion(), serializer.serialize(next)));
+    assertThat(store.seeks).containsExactly(name(savepoint));
+    PubSubEnumeratorCheckpoint fresh = snapshot(restored, 101);
+    assertThat(name(fresh)).isNotEqualTo(name(savepoint));
+    assertThat(store.creates).isEqualTo(4);
+    assertThat(store.resources).hasSize(3);
+  }
+
+  @Test
+  public void abortCreator_preservesBoundaryForDependentCheckpointAndLateAborts() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint creator = snapshot(manager, 1);
+    PubSubEnumeratorCheckpoint dependent = snapshot(manager, 2);
+
+    manager.notifyCheckpointAborted(1);
+    assertThat(store.resources).containsExactly(name(creator));
+    manager.notifyCheckpointComplete(2);
+    manager.notifyCheckpointAborted(1);
+    manager.notifyCheckpointAborted(2);
+
+    assertThat(store.resources).containsExactly(name(dependent));
+    PubSubReplaySnapshots.restore(store, 1, dependent);
+    assertThat(store.seeks).containsExactly(name(creator));
+  }
+
+  @Test
+  public void abortLastDependent_deletesOnlyUncommittedBoundary() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    snapshot(manager, 2);
+    manager.notifyCheckpointAborted(1);
+    manager.notifyCheckpointAborted(2);
+    assertThat(store.resources).isEmpty();
+
+    PubSubEnumeratorCheckpoint next = snapshot(manager, 3);
+    assertThat(name(next)).isNotEqualTo(name(first));
+    assertThat(store.resources).containsExactly(name(next));
+  }
+
+  @Test
+  public void repeatedSnapshot_keepsItsSelectionWhenOlderCheckpointCompletes() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    PubSubEnumeratorCheckpoint second = snapshot(manager, 2);
+    manager.notifyCheckpointComplete(1);
+    snapshot(manager, 3);
+
+    assertThat(snapshot(manager, 2)).isEqualTo(second);
+    assertThat(name(second)).isEqualTo(name(first));
+    assertThat(store.creates).isEqualTo(2);
+  }
+
+  @Test
+  public void outOfOrderSnapshot_neverSelectsFutureBoundary() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint future = snapshot(manager, 3);
+    assertThrows(IllegalArgumentException.class, () -> snapshot(manager, 2));
+    assertThat(store.resources).containsExactly(name(future));
+    assertThat(store.creates).isEqualTo(1);
   }
 
   @Test

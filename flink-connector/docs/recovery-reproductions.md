@@ -97,13 +97,13 @@ before Flink triggers the readers' checkpoint barriers, records the reference in
 enumerator state, and seeks to that reference on restore before assigning input.
 Acknowledgements still wait for successful Flink checkpoints.
 
-The count retains the most recent snapshot boundaries at or before the newest
-completed checkpoint, including intermediate savepoints, plus in-flight
-boundaries. It is a **bounded replay window**, not indefinite savepoint retention.
-The coordinator refuses new boundaries once it tracks `count + 1` snapshots;
-configure one concurrent checkpoint and let checkpoints complete between manual
-savepoints. It fails rather than growing an unbounded set when checkpoints stop
-completing. The source's serialized namespace also lets a fresh retry reclaim
+The count retains the most recent provider boundaries at or before the newest
+completed checkpoint, plus one shared pending boundary. Checkpoints and savepoints
+awaiting completion reuse that earlier snapshot. This includes savepoints that
+have no completion notification, so a full retention window cannot block the next
+checkpoint. Provider snapshots remain bounded by `count + 1`; recovery can replay
+additional input from a shared boundary. It is a **bounded replay window**, not
+indefinite savepoint retention. The source's serialized namespace also lets a fresh retry reclaim
 uncheckpointed resources from its earlier attempt.
 Restoring a pruned or expired snapshot fails. Checkpoints made without this mode
 cannot acquire replay protection retroactively. Disabling the option when

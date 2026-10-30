@@ -103,8 +103,8 @@ public class PubSubSplitEnumerator
             .setReplayDeduplicationRequired(replayDeduplicationRequired);
     if (replaySnapshots != null) {
       checkpoint.setReplaySubscription(subscriptionName.toString());
-      // Flink checkpoints coordinators before triggering task barriers. Create the shared
-      // subscription snapshot here, before any reader's checkpoint cut, rather than in one reader.
+      // Flink checkpoints coordinators before triggering task barriers. The selected shared
+      // subscription snapshot must already exist before any reader's checkpoint cut.
       replaySnapshots.snapshot(checkpointId, checkpoint);
     }
     return checkpoint.build();

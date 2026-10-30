@@ -348,8 +348,9 @@ public abstract class PubSubSource<OutputT>
 
     /**
      * Enables checkpoint-coordinated Pub/Sub snapshots and retains the last {@code count} snapshot
-     * boundaries at or before the newest completed checkpoint, plus in-flight boundaries. Total
-     * tracked boundaries are capped at {@code count + 1}; use one concurrent checkpoint.
+     * provider boundaries at or before the newest completed checkpoint, plus one shared pending
+     * boundary. Checkpoints and savepoints awaiting completion can reuse that earlier boundary;
+     * total provider snapshots stay bounded by {@code count + 1}.
      *
      * <p>Disabled by default. Requires a dedicated subscription and snapshot create, delete, list,
      * and seek permissions. Snapshot storage is billed separately. Older or expired snapshots

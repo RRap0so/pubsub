@@ -35,6 +35,7 @@ message PubSubEnumeratorCheckpoint {
   repeated Assignment assignments = 1;
   // Empty for checkpoints made without replay snapshot recovery.
   string replay_snapshot_namespace = 2;
+  // Creation checkpoint ID of the selected provider snapshot; it may precede this Flink checkpoint.
   int64 replay_checkpoint_id = 3;
   message ReplaySnapshot {
     int64 checkpoint_id = 1;

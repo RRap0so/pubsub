@@ -397,6 +397,59 @@ public class PubSubRecoveryIT {
         java.util.Set.copyOf(java.util.Arrays.asList(lastState.split(","))));
   }
 
+  @Test(timeout = 90000)
+  public void fullRetentionWindow_nativeSavepointAllowsNextCheckpointAndReplay() throws Exception {
+    String firstRun = runId();
+    JobClient original = startJob(firstRun, null, false, 2, 1, true);
+    publish("A");
+    await(() -> OUTPUT.get(firstRun).contains("A|A"), "A processed before filling retention");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    String savepoint =
+        original
+            .triggerSavepoint(savepointDir(), SavepointFormatType.NATIVE)
+            .get(20, TimeUnit.SECONDS);
+
+    publish("B");
+    await(() -> OUTPUT.get(firstRun).contains("B|A,B"), "B processed after the savepoint");
+    // With two completed boundaries and an unnotified savepoint, this checkpoint previously
+    // failed the capacity guard before any reader could snapshot or release its ACKs.
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cancel(original);
+    assertSubscriptionDrained();
+
+    String secondRun = runId();
+    JobClient restored = startJob(secondRun, savepoint, false, 2, 1, true);
+    publish("C");
+    await(
+        () -> OUTPUT.get(secondRun).stream().anyMatch(row -> row.startsWith("B|")),
+        "acknowledged B replayed from the retained savepoint boundary");
+    await(
+        () -> OUTPUT.get(secondRun).stream().anyMatch(row -> row.startsWith("C|")),
+        "new C processed after recovery");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(restored.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cancel(restored);
+    assertSubscriptionDrained();
+
+    List<String> output = OUTPUT.get(secondRun);
+    assertEquals(2, output.size());
+    String[] finalState = output.get(output.size() - 1).split("\\|", 2)[1].split(",");
+    assertEquals(3, finalState.length);
+    assertEquals(Set.of("A", "B", "C"), Set.copyOf(java.util.Arrays.asList(finalState)));
+  }
+
   private long duplicateDrops(JobClient job) {
     return metrics.findMetrics(job.getJobID(), ".*pubsubReplayDuplicatesDropped").values().stream()
         .mapToLong(metric -> ((Counter) metric).getCount())
