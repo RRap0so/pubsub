@@ -68,7 +68,7 @@ import org.junit.Test;
  * Real source reader and ack tracker against a local Pub/Sub emulator. Checkpoint callbacks are
  * driven explicitly: this is not a Flink MiniCluster/HA test.
  */
-public class PubSubCheckpointRecoveryEmulatorTest {
+public class PubSubCheckpointRecoveryEmulatorIT {
   private final HttpClient http = HttpClient.newHttpClient();
   private final List<SourceReader<String, SubscriptionSplit>> readers = new ArrayList<>();
   private final List<ManagedChannel> channels = new ArrayList<>();

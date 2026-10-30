@@ -42,7 +42,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 /** Verifies SDK-owned publisher transport closure against an isolated local emulator topic. */
-public class PubSubSinkChannelEmulatorTest {
+public class PubSubSinkChannelEmulatorIT {
   private final HttpClient http = HttpClient.newHttpClient();
   private final List<ManagedChannel> channels = new ArrayList<>();
   private String endpoint;

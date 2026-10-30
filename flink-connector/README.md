@@ -47,7 +47,7 @@ Prerequisites:
 *   Unix-like environment (we use Linux, Mac OS X)
 *   Git
 *   Maven (we recommend version 3.8.6)
-*   Java 11
+*   Java 17
 
 ```sh
 git clone https://github.com/GoogleCloudPlatform/pubsub.git
@@ -72,6 +72,37 @@ their pom.xml file by adding:
 
 Learn more about Flink connector packaging
 [here](https://nightlies.apache.org/flink/flink-docs-master/docs/dev/configuration/overview/).
+
+## Running Tests
+
+The connector build uses Java 17 (as configured in the parent POM).
+From `flink-connector/`, run unit tests with:
+
+```sh
+mvn test
+```
+
+Recovery integration tests use Maven Failsafe and a local Pub/Sub emulator.
+Start an installed emulator in a separate terminal:
+
+```sh
+gcloud beta emulators pubsub start --project=checkpoint-repro --host-port=127.0.0.1:8085 --quiet
+```
+
+Then run unit tests and integration tests through Maven's `verify` phase:
+
+```sh
+CHECKPOINT_TEST_EMULATOR=127.0.0.1:8085 mvn -Precovery-it clean verify
+```
+
+The profile requires a loopback emulator endpoint and supplies it to the Pub/Sub
+SDK. No cloud credentials are needed. CI runs this same Maven command. Unit and
+integration results are written to `target/surefire-reports/` and
+`target/failsafe-reports/` in the connector module. The real-service exactly-once
+acknowledgement test is skipped because the emulator does not implement that feature.
+
+For convenience, `bash ./run-recovery-tests.sh` starts an installed emulator,
+runs the same Maven profile, and stops the emulator when the build finishes.
 
 ## Quickstart
 
