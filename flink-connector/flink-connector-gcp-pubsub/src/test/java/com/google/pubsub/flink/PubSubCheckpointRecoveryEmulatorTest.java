@@ -19,10 +19,14 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 
 import com.google.api.gax.core.NoCredentialsProvider;
 import com.google.api.gax.grpc.GrpcTransportChannel;
+import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import com.google.api.gax.rpc.FixedTransportChannelProvider;
 import com.google.cloud.pubsub.v1.MessageReceiver;
 import com.google.cloud.pubsub.v1.Subscriber;
@@ -46,6 +50,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.api.connector.source.SourceReaderContext;
@@ -92,6 +97,78 @@ public class PubSubCheckpointRecoveryEmulatorTest {
             .setDeserializationSchema(
                 PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()))
             .build();
+  }
+
+  @Test(timeout = 30000)
+  public void subscriberStop_closesItsSdkOwnedChannel() throws Exception {
+    AtomicReference<ManagedChannel> channel = new AtomicReference<>();
+    Subscriber subscriber = observedSubscriber(channel);
+    assertEquals(null, channel.get()); // Building a subscriber does not allocate a transport.
+    try {
+      subscriber.startAsync().awaitRunning(10, TimeUnit.SECONDS);
+      assertTrue(channel.get() != null);
+      subscriber.stopAsync().awaitTerminated(10, TimeUnit.SECONDS);
+      assertTrue(
+          "Subscriber stop must close its channel",
+          channel.get().awaitTermination(5, TimeUnit.SECONDS));
+    } finally {
+      subscriber.stopAsync();
+    }
+  }
+
+  @Test(timeout = 30000)
+  public void subscriberFailure_closesItsSdkOwnedChannel() throws Exception {
+    AtomicReference<ManagedChannel> channel = new AtomicReference<>();
+    Subscriber subscriber = observedSubscriber(channel);
+    boolean deleted = false;
+    try {
+      subscriber.startAsync().awaitRunning(10, TimeUnit.SECONDS);
+      api("DELETE", subscription, "");
+      deleted = true;
+      long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+      while (subscriber.state() != com.google.api.core.ApiService.State.FAILED
+          && System.nanoTime() < deadline) {
+        Thread.sleep(10);
+      }
+      assertEquals(com.google.api.core.ApiService.State.FAILED, subscriber.state());
+      assertTrue(
+          "Subscriber failure must close its channel",
+          channel.get().awaitTermination(5, TimeUnit.SECONDS));
+    } finally {
+      subscriber.stopAsync();
+      if (deleted) {
+        api("PUT", subscription, "{\"topic\":\"" + topic + "\",\"ackDeadlineSeconds\":10}");
+      }
+    }
+  }
+
+  private Subscriber observedSubscriber(AtomicReference<ManagedChannel> channel) {
+    PubSubSource<String> observed = spy(source);
+    doAnswer(
+            invocation -> {
+              InstantiatingGrpcChannelProvider provider =
+                  (InstantiatingGrpcChannelProvider) invocation.callRealMethod();
+              var plaintext = provider.toBuilder().getChannelConfigurator();
+              return provider.toBuilder()
+                  .setChannelConfigurator(
+                      builder -> {
+                        ManagedChannelBuilder<?> tracked = spy(plaintext.apply(builder));
+                        doAnswer(
+                                build -> {
+                                  ManagedChannel created = (ManagedChannel) build.callRealMethod();
+                                  channels.add(created);
+                                  channel.set(created);
+                                  return created;
+                                })
+                            .when(tracked)
+                            .build();
+                        return tracked;
+                      })
+                  .build();
+            })
+        .when(observed)
+        .createChannelProvider(any());
+    return observed.createSubscriber((message, consumer) -> consumer.nack());
   }
 
   @Test(timeout = 30000)
