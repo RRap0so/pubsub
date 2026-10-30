@@ -104,8 +104,24 @@ public class PubSubNotifyingPullSubscriber implements NotifyingPullSubscriber {
     completeNotification(permanentError);
     messages.clear();
     // Nack all outstanding messages, so that they are redelivered quickly.
-    ackTracker.nackAll();
-    subscriber.stopAsync().awaitTerminated();
+    Throwable failure = null;
+    try {
+      ackTracker.nackAll();
+    } catch (RuntimeException | Error e) {
+      failure = e;
+      throw e;
+    } finally {
+      try {
+        subscriber.stopAsync().awaitTerminated();
+      } catch (RuntimeException | Error stopFailure) {
+        if (failure == null) {
+          throw stopFailure;
+        }
+        if (stopFailure != failure) {
+          failure.addSuppressed(stopFailure);
+        }
+      }
+    }
   }
 
   private synchronized void receiveMessage(

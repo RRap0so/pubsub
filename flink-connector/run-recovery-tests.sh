@@ -52,6 +52,6 @@ fi
 echo "Using local emulator: $CHECKPOINT_TEST_EMULATOR"
 echo "Emulator log: $task_dir/emulator.log"
 mvn -q -pl flink-connector-gcp-pubsub \
-  '-Dtest=*Test,PubSubRecoveryIT' \
+  '-Dtest=*Test,PubSubRecoveryIT,PubSubSeekAcknowledgementIT' \
   '-DargLine=--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED' \
   clean test

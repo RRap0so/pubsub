@@ -201,6 +201,53 @@ public class PubSubReplaySnapshotsTest {
     assertThat(store.closed).isTrue();
   }
 
+  @Test
+  public void repeatedRecovery_keepsRetentionBoundedAndEverySelectedSnapshotRestorable()
+      throws Exception {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    PubSubCheckpointSerializer serializer = new PubSubCheckpointSerializer();
+    for (long id = 1; id <= 200; id++) {
+      PubSubEnumeratorCheckpoint checkpoint = snapshot(manager, id);
+      // Every persisted reference must exist at the checkpoint boundary.
+      for (var reference : checkpoint.getReplaySnapshotsList()) {
+        assertThat(store.resources).contains(reference.getName());
+      }
+      assertThat(store.resources.size()).isAtMost(3);
+      manager.notifyCheckpointComplete(id);
+      assertThat(store.resources.size()).isAtMost(2);
+      if (id % 5 == 0) {
+        manager.close();
+        checkpoint =
+            serializer.deserialize(serializer.getVersion(), serializer.serialize(checkpoint));
+        manager = PubSubReplaySnapshots.restore(store, 2, checkpoint);
+        assertThat(store.seeks.get(store.seeks.size() - 1)).isEqualTo(name(checkpoint));
+        assertThat(store.resources).contains(name(checkpoint));
+        assertThat(store.resources.size()).isAtMost(2);
+      }
+    }
+    assertThat(store.creates).isEqualTo(200);
+    assertThat(store.seeks).hasSize(40);
+  }
+
+  @Test
+  public void failedSeek_doesNotDeleteAnySnapshotOrCreateReplacementBoundary() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    PubSubEnumeratorCheckpoint checkpoint = snapshot(manager, 1);
+    snapshot(manager, 2);
+    Set<String> before = new LinkedHashSet<>(store.resources);
+    int creates = store.creates;
+    store.failSeek = true;
+
+    assertThrows(
+        IllegalStateException.class, () -> PubSubReplaySnapshots.restore(store, 2, checkpoint));
+
+    assertThat(store.resources).containsExactlyElementsIn(before);
+    assertThat(store.creates).isEqualTo(creates);
+    store.failSeek = false;
+    PubSubReplaySnapshots.restore(store, 2, checkpoint);
+    assertThat(store.resources).containsExactly(name(checkpoint));
+  }
+
   private static PubSubEnumeratorCheckpoint snapshot(PubSubReplaySnapshots manager, long id) {
     PubSubEnumeratorCheckpoint.Builder checkpoint = PubSubEnumeratorCheckpoint.newBuilder();
     manager.snapshot(id, checkpoint);
@@ -220,6 +267,7 @@ public class PubSubReplaySnapshotsTest {
     final Set<String> failedDeletions = new HashSet<>();
     final List<String> seeks = new ArrayList<>();
     boolean failAfterCreate;
+    boolean failSeek;
     boolean closed;
     int creates;
 
@@ -236,6 +284,9 @@ public class PubSubReplaySnapshotsTest {
 
     @Override
     public void seek(String name) {
+      if (failSeek) {
+        throw new IllegalStateException("Injected seek RPC failure");
+      }
       if (!resources.contains(name)) {
         throw new IllegalStateException("Replay snapshot is missing");
       }

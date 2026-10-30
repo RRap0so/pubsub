@@ -17,6 +17,7 @@ package com.google.pubsub.flink.internal.source.reader;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -198,6 +199,36 @@ public class PubSubNotifyingPullSubscriberTest {
 
     assertThrows(Exception.class, () -> pullSubscriber.pullMessage());
     assertThrows(ExecutionException.class, () -> pullSubscriber.notifyDataAvailable().get());
+  }
+
+  @Test
+  public void shutdown_nackFailureStillStopsSubscriber() {
+    when(mockSubscriber.stopAsync()).thenReturn(mockSubscriber);
+    doThrow(new IllegalStateException("Injected negative acknowledgement failure"))
+        .when(mockAckTracker)
+        .nackAll();
+
+    assertThrows(IllegalStateException.class, () -> pullSubscriber.shutdown());
+
+    // Transport shutdown must still be attempted when releasing deliveries fails.
+    verify(mockSubscriber).stopAsync();
+    verify(mockSubscriber).awaitTerminated();
+  }
+
+  @Test
+  public void shutdown_nackAndStopFailuresPreserveOriginalFailure() {
+    IllegalStateException nackFailure = new IllegalStateException("Injected nack failure");
+    IllegalStateException stopFailure =
+        new IllegalStateException("Injected subscriber stop failure");
+    doThrow(nackFailure).when(mockAckTracker).nackAll();
+    when(mockSubscriber.stopAsync()).thenThrow(stopFailure);
+
+    IllegalStateException thrown =
+        assertThrows(IllegalStateException.class, () -> pullSubscriber.shutdown());
+
+    assertThat(thrown).isSameInstanceAs(nackFailure);
+    assertThat(thrown.getSuppressed()).asList().containsExactly(stopFailure);
+    verify(mockSubscriber).stopAsync();
   }
 
   @Test

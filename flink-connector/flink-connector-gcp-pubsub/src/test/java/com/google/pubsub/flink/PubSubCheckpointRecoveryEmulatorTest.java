@@ -28,6 +28,7 @@ import com.google.api.gax.core.NoCredentialsProvider;
 import com.google.api.gax.grpc.GrpcTransportChannel;
 import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import com.google.api.gax.rpc.FixedTransportChannelProvider;
+import com.google.cloud.pubsub.v1.AckReplyConsumer;
 import com.google.cloud.pubsub.v1.MessageReceiver;
 import com.google.cloud.pubsub.v1.Subscriber;
 import com.google.pubsub.flink.internal.source.reader.PubSubAckTracker;
@@ -46,7 +47,9 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -366,6 +369,108 @@ public class PubSubCheckpointRecoveryEmulatorTest {
     assertThrows(
         com.google.api.gax.rpc.NotFoundException.class,
         () -> source.restoreEnumerator(null, checkpoint));
+  }
+
+  @Test(timeout = 60000)
+  public void shutdownWithBackpressure_releasesSdkDeliveriesAndRecoversEveryUncheckpointedRecord()
+      throws Exception {
+    int total = 3000;
+    int outstandingLimit = 512;
+    PubSubSource<String> base =
+        PubSubSource.<String>builder()
+            .setProjectName("checkpoint-repro")
+            .setSubscriptionName(subscription.substring(subscription.lastIndexOf('/') + 1))
+            .setEndpoint("emulator:///" + endpoint)
+            .setParallelPullCount(1)
+            .setMaxOutstandingMessagesCount((long) outstandingLimit)
+            .setDeserializationSchema(
+                PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()))
+            .build();
+    AtomicInteger delivered = new AtomicInteger();
+    AtomicInteger nacked = new AtomicInteger();
+    AtomicInteger acked = new AtomicInteger();
+    source = spy(base);
+    doAnswer(
+            invocation -> {
+              MessageReceiver receiver = invocation.getArgument(0);
+              return base.createSubscriber(
+                  (message, consumer) -> {
+                    receiver.receiveMessage(
+                        message,
+                        new AckReplyConsumer() {
+                          @Override
+                          public void ack() {
+                            acked.incrementAndGet();
+                            consumer.ack();
+                          }
+
+                          @Override
+                          public void nack() {
+                            nacked.incrementAndGet();
+                            consumer.nack();
+                          }
+                        });
+                    delivered.incrementAndGet();
+                  });
+            })
+        .when(source)
+        .createSubscriber(any());
+    SourceReader<String, SubscriptionSplit> original = reader(null);
+    Set<String> expected = new HashSet<>();
+    for (int start = 0; start < total; start += 100) {
+      List<String> batch = new ArrayList<>();
+      for (int id = start; id < start + 100; id++) {
+        String value = "record-" + id;
+        expected.add(value);
+        String data = Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+        batch.add("{\"data\":\"" + data + "\"}");
+      }
+      api("POST", topic + ":publish", "{\"messages\":[" + String.join(",", batch) + "]}");
+    }
+    long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+    while (delivered.get() < outstandingLimit && System.nanoTime() < deadline) {
+      Thread.sleep(10); // Deliberately do not poll: input is backpressured, with no checkpoint.
+    }
+    assertTrue(
+        "SDK did not fill its outstanding-message capacity", delivered.get() >= outstandingLimit);
+    original.close();
+    readers.remove(original);
+    assertEquals("Uncheckpointed deliveries must not be acknowledged", 0, acked.get());
+    assertEquals("Shutdown must nack every observed SDK delivery", delivered.get(), nacked.get());
+
+    source = base;
+    SourceReader<String, SubscriptionSplit> restored = reader(null);
+    TestingReaderOutput<String> output = new TestingReaderOutput<>();
+    Set<String> recovered = new HashSet<>();
+    long checkpoint = 1;
+    int checkpointedOutput = 0;
+    deadline = System.nanoTime() + Duration.ofSeconds(25).toNanos();
+    while (recovered.size() < total && System.nanoTime() < deadline) {
+      restored.pollNext(output);
+      List<String> records = output.getEmittedRecords();
+      recovered.addAll(records);
+      if (records.size() - checkpointedOutput >= 128) {
+        restored.snapshotState(checkpoint);
+        restored.notifyCheckpointComplete(checkpoint++);
+        checkpointedOutput = records.size();
+      }
+      Thread.sleep(1);
+    }
+    Set<String> missing = new HashSet<>(expected);
+    missing.removeAll(recovered);
+    System.out.println(
+        "BACKPRESSURE_RECOVERY published="
+            + total
+            + " oldSdkDeliveries="
+            + delivered.get()
+            + " oldNacks="
+            + nacked.get()
+            + " recoveredUnique="
+            + recovered.size()
+            + " missing="
+            + missing);
+    assertEquals("Missing or unexpected records after SDK shutdown", expected, recovered);
+    // Raw source delivery is at-least-once: duplicate delivery alone is not a failure here.
   }
 
   private void pollFor(

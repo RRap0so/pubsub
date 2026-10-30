@@ -16,7 +16,10 @@
 package com.google.pubsub.flink.internal.source.reader;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -43,6 +46,59 @@ public class PubSubAckTrackerTest {
     ackTracker.addCheckpoint(1L);
     ackTracker.notifyCheckpointComplete(1L);
     verify(mockAck).ack();
+  }
+
+  @Test
+  public void checkpointAckFailure_keepsFailedDeliveryAvailableForShutdown() {
+    AckReplyConsumer consumer = mock(AckReplyConsumer.class);
+    doThrow(new IllegalStateException("Injected acknowledgement callback failure"))
+        .when(consumer)
+        .ack();
+    ackTracker.addPendingAck("message-id", consumer);
+    ackTracker.stagePendingAck("message-id");
+    ackTracker.addCheckpoint(1L);
+
+    assertThrows(IllegalStateException.class, () -> ackTracker.notifyCheckpointComplete(1L));
+    ackTracker.nackAll();
+
+    // A failed callback must not make the delivery disappear from shutdown cleanup.
+    // This injects a synchronous failure; it does not model a broker acknowledgement response.
+    verify(consumer).nack();
+  }
+
+  @Test
+  public void partialCheckpointAckFailure_retriesOnlyRemainingIdsUsingLatestDelivery() {
+    AckReplyConsumer first = mock(AckReplyConsumer.class);
+    AckReplyConsumer failed = mock(AckReplyConsumer.class);
+    AckReplyConsumer latest = mock(AckReplyConsumer.class);
+    AckReplyConsumer last = mock(AckReplyConsumer.class);
+    doThrow(new IllegalStateException("Injected acknowledgement callback failure"))
+        .when(failed)
+        .ack();
+    ackTracker.addPendingAck("first", first);
+    ackTracker.stagePendingAck("first");
+    ackTracker.addPendingAck("failed", failed);
+    ackTracker.stagePendingAck("failed");
+    ackTracker.addPendingAck("last", last);
+    ackTracker.stagePendingAck("last");
+    ackTracker.addCheckpoint(1L);
+
+    assertThrows(IllegalStateException.class, () -> ackTracker.notifyCheckpointComplete(1L));
+    verify(first).ack();
+    verify(last, never()).ack();
+    assertThat(ackTracker.trackMessageDelivery("failed", latest)).isFalse();
+    ackTracker.notifyCheckpointComplete(1L);
+    ackTracker.notifyCheckpointComplete(1L); // Repeated completion must be harmless.
+    ackTracker.nackAll();
+
+    verify(first, times(1)).ack();
+    verify(failed, times(1)).ack();
+    verify(latest, times(1)).ack();
+    verify(last, times(1)).ack();
+    verify(first, never()).nack();
+    verify(failed, never()).nack();
+    verify(latest, never()).nack();
+    verify(last, never()).nack();
   }
 
   @Test

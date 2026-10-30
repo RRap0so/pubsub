@@ -20,6 +20,7 @@ import static org.junit.Assert.assertTrue;
 
 import com.google.protobuf.util.JsonFormat;
 import com.google.pubsub.v1.ListSnapshotsResponse;
+import com.google.pubsub.v1.PublishResponse;
 import com.google.pubsub.v1.PullResponse;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -31,9 +32,14 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -397,6 +403,133 @@ public class PubSubRecoveryIT {
         .sum();
   }
 
+  @Test(timeout = 120000)
+  public void replayDeduplication_bulkPublishingAcrossSavepointAndRestore_preservesEveryRecord()
+      throws Exception {
+    int beforeSavepoint = 500;
+    int beforeRollback = 1500;
+    int total = 3000;
+    Map<String, String> publications = new ConcurrentHashMap<>();
+    ExecutorService publisher = Executors.newSingleThreadExecutor();
+    CountDownLatch resumeDuringRestore = new CountDownLatch(1);
+    try {
+      String firstRun = runId();
+      JobClient original = startJob(firstRun, null, false, 4, 2, true, 10000L);
+      publishRange(0, beforeSavepoint, publications);
+      await(() -> OUTPUT.get(firstRun).size() == beforeSavepoint, "initial 500 records processed");
+      Future<?> publishing =
+          publisher.submit(
+              () -> {
+                try {
+                  for (int start = beforeSavepoint; start < total; start += 25) {
+                    if (start == beforeRollback) {
+                      assertTrue(
+                          "Restore phase never started",
+                          resumeDuringRestore.await(45, TimeUnit.SECONDS));
+                    }
+                    publishRange(start, start + 25, publications);
+                    Thread.sleep(20);
+                  }
+                } catch (Exception failure) {
+                  throw new RuntimeException("Synthetic publisher failed", failure);
+                }
+              });
+      // Publication continues while the older savepoint is taken, so its precise membership
+      // is deliberately unknown. The final assertion must recover all IDs regardless of it.
+      String oldSavepoint =
+          original
+              .triggerSavepoint(savepointDir(), SavepointFormatType.CANONICAL)
+              .get(20, TimeUnit.SECONDS);
+      await(
+          () -> OUTPUT.get(firstRun).size() == beforeRollback,
+          "all 1500 pre-rollback records processed");
+      cluster
+          .getClusterClient()
+          .triggerCheckpoint(original.getJobID(), CheckpointType.FULL)
+          .get(20, TimeUnit.SECONDS);
+      cancel(original); // Flush newer acknowledgements before rolling back to the old savepoint.
+      assertSubscriptionDrained();
+
+      String secondRun = runId();
+      resumeDuringRestore.countDown(); // Publish the remaining 1500 while recovery starts.
+      JobClient restored = startJob(secondRun, oldSavepoint, false, 4, 1, true, 10000L);
+      publishing.get(30, TimeUnit.SECONDS); // Publisher errors must not masquerade as source loss.
+      assertEquals(total, publications.size());
+      assertEquals(
+          "Every publication must have a distinct provider ID",
+          total,
+          Set.copyOf(publications.values()).size());
+      long deadline = System.nanoTime() + Duration.ofSeconds(25).toNanos();
+      while (System.nanoTime() < deadline) {
+        List<String> output = OUTPUT.get(secondRun);
+        if (!output.isEmpty()
+            && output.get(output.size() - 1).split("\\|", 2)[1].split(",").length >= total) {
+          break;
+        }
+        Thread.sleep(20);
+      }
+      cluster
+          .getClusterClient()
+          .triggerCheckpoint(restored.getJobID(), CheckpointType.FULL)
+          .get(20, TimeUnit.SECONDS);
+      long dropped = duplicateDrops(restored);
+      cancel(restored);
+      assertSubscriptionDrained();
+
+      List<String> output = OUTPUT.get(secondRun);
+      assertTrue("Restored job produced no records", !output.isEmpty());
+      String[] state = output.get(output.size() - 1).split("\\|", 2)[1].split(",");
+      Set<String> recovered = Set.copyOf(java.util.Arrays.asList(state));
+      Set<String> missing = new java.util.HashSet<>(publications.keySet());
+      missing.removeAll(recovered);
+      System.out.println(
+          "BULK_REPLAY published="
+              + publications.size()
+              + " businessCount="
+              + state.length
+              + " uniqueBusinessIds="
+              + recovered.size()
+              + " replayDuplicatesDropped="
+              + dropped
+              + " missing="
+              + missing);
+      assertEquals("Missing or unexpected business IDs", publications.keySet(), recovered);
+      assertEquals("Replay double-counted business records", total, state.length);
+      assertTrue("The replay must actually exercise deduplication", dropped > 0);
+    } finally {
+      resumeDuringRestore.countDown();
+      publisher.shutdownNow();
+      assertTrue("Publisher did not stop", publisher.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private void publishRange(int from, int to, Map<String, String> publications) throws Exception {
+    for (int start = from; start < to; start += 25) {
+      int end = Math.min(start + 25, to);
+      List<String> messages = new ArrayList<>();
+      for (int id = start; id < end; id++) {
+        String value = "record-" + id;
+        String data = Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+        messages.add("{\"data\":\"" + data + "\"}");
+      }
+      PublishResponse.Builder response = PublishResponse.newBuilder();
+      JsonFormat.parser()
+          .merge(
+              api(
+                  "POST",
+                  topic + ":publish",
+                  "{\"messages\":[" + String.join(",", messages) + "]}"),
+              response);
+      assertEquals(
+          "Publish response must account for every submitted record",
+          end - start,
+          response.getMessageIdsCount());
+      for (int id = start; id < end; id++) {
+        publications.put("record-" + id, response.getMessageIds(id - start));
+      }
+    }
+  }
+
   public static class KeyedSessionAccumulator extends RichMapFunction<String, String> {
     private final String run;
     private transient ValueState<String> session;
@@ -448,6 +581,19 @@ public class PubSubRecoveryIT {
       int parallelism,
       boolean deduplicate)
       throws Exception {
+    return startJob(
+        run, savepoint, checkpointing, replayRetention, parallelism, deduplicate, 1000L);
+  }
+
+  private JobClient startJob(
+      String run,
+      String savepoint,
+      boolean checkpointing,
+      int replayRetention,
+      int parallelism,
+      boolean deduplicate,
+      long maxOutstandingMessages)
+      throws Exception {
     Configuration config = new Configuration();
     config.setString("restart-strategy.type", "fixed-delay");
     config.setString("restart-strategy.fixed-delay.attempts", "3");
@@ -470,6 +616,7 @@ public class PubSubRecoveryIT {
             .setProjectName("checkpoint-repro")
             .setSubscriptionName("pubsub-" + suffix)
             .setEndpoint("emulator:///" + endpoint)
+            .setMaxOutstandingMessagesCount(maxOutstandingMessages)
             .setDeserializationSchema(
                 PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()));
     if (replayRetention > 0) {

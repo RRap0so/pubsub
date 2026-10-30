@@ -70,11 +70,25 @@ public class PubSubAckTracker implements AckTracker {
 
   @Override
   public synchronized void notifyCheckpointComplete(long checkpointId) {
-    List<String> toAck = new ArrayList<>();
     while (!checkpoints.isEmpty() && checkpoints.firstKey() <= checkpointId) {
-      toAck.addAll(checkpoints.remove(checkpoints.firstKey()));
+      long completed = checkpoints.firstKey();
+      List<String> messages = checkpoints.get(completed);
+      int acknowledged = 0;
+      try {
+        for (String messageId : messages) {
+          AckReplyConsumer consumer = outstandingAcks.get(messageId);
+          // Keep ownership until the callback returns. On failure, shutdown can still nack
+          // the delivery, or a later completion can retry it using its latest delivery handle.
+          consumer.ack();
+          outstandingAcks.remove(messageId, consumer);
+          acknowledged++;
+        }
+      } finally {
+        // Discard the successful prefix in one linear operation, including after partial failure.
+        messages.subList(0, acknowledged).clear();
+      }
+      checkpoints.remove(completed);
     }
-    toAck.forEach(messageId -> outstandingAcks.remove(messageId).ack());
   }
 
   @Override
