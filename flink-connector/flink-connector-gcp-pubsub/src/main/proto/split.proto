@@ -45,4 +45,6 @@ message PubSubEnumeratorCheckpoint {
   string replay_subscription = 5;
   // Prevent restoring without the checkpointed message-ID index, or adding an empty index.
   bool replay_deduplication_required = 6;
+  // Known unneeded resources only; unknown snapshots may belong to newer savepoints.
+  repeated string pending_snapshot_deletions = 7;
 }

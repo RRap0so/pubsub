@@ -69,16 +69,31 @@ public final class PubSubCheckpointSerializerTest {
         .isFalse();
     PubSubEnumeratorCheckpoint protectedCheckpoint =
         PubSubEnumeratorCheckpoint.newBuilder().setReplayDeduplicationRequired(true).build();
-    assertThat(
-            serializer.deserialize(
-                serializer.getVersion(), serializer.serialize(protectedCheckpoint)))
+    assertThat(serializer.deserialize(2, serializer.serialize(protectedCheckpoint)))
         .isEqualTo(protectedCheckpoint);
+  }
+
+  @Test
+  public void serialization_preservesPendingDeletionsInVersionThree() throws Exception {
+    PubSubCheckpointSerializer serializer = new PubSubCheckpointSerializer();
+    PubSubEnumeratorCheckpoint checkpoint =
+        PubSubEnumeratorCheckpoint.newBuilder()
+            .addPendingSnapshotDeletions("flink-namespace-candidate")
+            .build();
+    assertThat(serializer.getVersion()).isEqualTo(3);
+    assertThat(serializer.deserialize(serializer.getVersion(), serializer.serialize(checkpoint)))
+        .isEqualTo(checkpoint);
+    assertThat(
+            serializer
+                .deserialize(2, PubSubEnumeratorCheckpoint.getDefaultInstance().toByteArray())
+                .getPendingSnapshotDeletionsList())
+        .isEmpty();
   }
 
   @Test
   public void deserialize_rejectsUnknownVersion() {
     assertThrows(
         java.io.IOException.class,
-        () -> new PubSubCheckpointSerializer().deserialize(3, new byte[0]));
+        () -> new PubSubCheckpointSerializer().deserialize(4, new byte[0]));
   }
 }

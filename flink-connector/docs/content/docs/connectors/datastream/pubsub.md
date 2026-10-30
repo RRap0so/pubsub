@@ -150,9 +150,28 @@ Restore preserves unreferenced snapshots because they may belong to newer comple
 savepoints. Those resources remain until provider expiry or explicit reviewed cleanup.
 They and pending deletions count toward the namespace's `count + 1` resource budget.
 If that budget is full, a checkpoint reuses a valid known boundary rather than creating
-another resource. Restarts therefore cannot evade the resource budget.
+another resource. Restarts therefore cannot evade the resource budget. The coordinator
+lists the namespace once on startup or restore, then tracks its own creates and deletes
+locally; checkpoint allocation does not repeat a project-wide list. External removals,
+including provider expiry of unknown snapshots, require restarting the coordinator
+to refresh that inventory.
+
+After restoring an older checkpoint with a full budget, successive checkpoints may keep
+selecting its older provider boundary. This increases replay and lets that boundary age.
+A healthy running job can create a fresh boundary when expiry and successful cleanup free
+a slot, but recovery from a checkpoint referencing an expired boundary fails. Before
+that point, stop the job and review whether newer savepoints can be abandoned. Use
+`PubSubReplaySnapshotCleanup` to delete only their unneeded snapshots, then restart from
+the retained checkpoint to refresh the budget. Preserve every snapshot still needed by
+any checkpoint or savepoint you intend to restore.
 
 Failed deletes are queued, logged, and retried without failing checkpoint completion.
+The queue is included in subsequent checkpoint state and retried after a successful
+restore seek. This covers cleanup recorded in a completed checkpoint. A remote create
+followed by a crash before its cleanup intent reaches a completed checkpoint can still
+leave an unknown snapshot. Restore preserves it because it cannot distinguish it from
+a valid newer savepoint. It counts toward the budget until a restart refreshes the
+inventory after provider expiry or reviewed cleanup.
 If creating a new snapshot fails, an existing unexpired boundary can be reused to
 allow checkpoint ACKs and backlog drainage. Recovery may consequently replay more
 input. A missing or expired boundary is never used as a fallback. If no safe boundary
@@ -201,11 +220,11 @@ applies to the downstream watermark operator; source-split idleness and source w
 alignment are not provided by this helper. Pipelines requiring these semantics need a
 different topology and should not assume the helper preserves them.
 
-### Cleanup of permanently abandoned snapshots
+### Cleanup of unneeded snapshots
 
-`PubSubReplaySnapshotCleanup` provides explicit cleanup for a permanently abandoned
-job. Obtain the exact namespace from that job's persisted enumerator checkpoint;
-never infer ownership from a topic or a broad prefix alone.
+`PubSubReplaySnapshotCleanup` provides explicit offline cleanup for abandoned recovery
+points or a permanently abandoned job. Obtain the exact namespace from that job's
+persisted enumerator checkpoint; never infer ownership from a topic or a broad prefix alone.
 
 ```java
 String namespace = abandonedCheckpoint.getReplaySnapshotNamespace();
@@ -213,8 +232,8 @@ List<String> candidates = PubSubReplaySnapshotCleanup.list(source, namespace);
 candidates.forEach(System.out::println); // Review and save the exact names first.
 ```
 
-After confirming the job cannot run again and no retained checkpoint or savepoint
-needs these resources, pass only the explicitly reviewed names:
+Stop the job before cleanup. After confirming no checkpoint or savepoint you intend
+to restore needs the selected resources, pass only the explicitly reviewed names:
 
 ```java
 PubSubReplaySnapshotCleanup.deleteReviewed(source, namespace, reviewedNames);
@@ -225,7 +244,9 @@ The subscription must still exist for the topic check. Listing does not delete a
 missing resources are harmless and the same reviewed list can be retried after a partial
 failure. Snapshots created after review are not implicitly added. Cleanup cannot detect
 active jobs and must not run automatically based only on age. Deletion permanently
-removes the corresponding recovery points.
+removes the corresponding recovery points. When cleaning up after rollback, keep the
+selected restore boundary and all other required boundaries, then restart the job to
+refresh its namespace inventory.
 
 ### StreamingPull Connections and Flow Control
 
@@ -511,7 +532,9 @@ The coordinator's `pubsub` group exposes `snapshotCreateFailures`,
 `snapshotDeleteFailures`, `pendingSnapshotDeletions`, and
 `replaySnapshotTimeToExpiryMillis`. The expiry gauge is cached metadata for the
 selected replay boundary; reporters do not issue provider RPCs. Watch it when
-creation is repeatedly falling back to an older snapshot. Expiry remains a hard
+creation is repeatedly falling back to an older snapshot, including after rollback
+with a full resource budget. Alert before the remaining lifetime becomes shorter than
+your expected recovery and operator response time. Expiry remains a hard
 limit on recovery, even when checkpoints continue to ACK input.
 
 ## Integration Testing

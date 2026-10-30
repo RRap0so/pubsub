@@ -24,18 +24,19 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
-/** Explicit cleanup of replay snapshots belonging to a permanently abandoned job. */
+/** Explicit offline cleanup of replay snapshots no longer needed by any retained recovery point. */
 public final class PubSubReplaySnapshotCleanup {
   private PubSubReplaySnapshotCleanup() {}
 
   /**
-   * Lists an exact namespace without deleting anything. Obtain the namespace from the abandoned
-   * job's enumerator checkpoint. Names must be reviewed before calling {@link #deleteReviewed}.
+   * Lists an exact namespace without deleting anything. Obtain the namespace from the job's
+   * persisted enumerator checkpoint. Names must be reviewed before calling {@link #deleteReviewed}.
    *
-   * <p>Do not clean snapshots while the job can run or while any checkpoint may still be restored.
-   * Snapshot metadata identifies the topic, not its originating subscription; the exact namespace
-   * is the ownership token. The configured subscription must still exist so its topic can be
-   * checked. This utility cannot detect active jobs or coordinate with their operators.
+   * <p>Stop the job before cleanup. Delete only snapshots not needed by any checkpoint or savepoint
+   * you intend to restore. Restart the job afterward to refresh its namespace inventory. Snapshot
+   * metadata identifies the topic, not its originating subscription; the exact namespace is the
+   * ownership token. The configured subscription must still exist so its topic can be checked. This
+   * utility cannot detect active jobs or coordinate with their operators.
    */
   public static List<String> list(PubSubSource<?> source, String namespace) throws IOException {
     validateNamespace(namespace);
@@ -50,8 +51,9 @@ public final class PubSubReplaySnapshotCleanup {
    * namespace; the subscription topic is checked before any deletion. Missing resources are
    * harmless, and the same list can be retried after partial RPC failure.
    *
-   * <p>This permanently removes recovery boundaries. Invoke only for a permanently abandoned job
-   * whose snapshots are no longer needed. Never schedule automatic cleanup based solely on age.
+   * <p>This permanently removes recovery boundaries. Invoke only while the job is stopped and only
+   * for snapshots no retained checkpoint or savepoint needs. Never schedule automatic cleanup based
+   * solely on age.
    */
   public static void deleteReviewed(
       PubSubSource<?> source, String namespace, List<String> reviewedSnapshots) throws IOException {

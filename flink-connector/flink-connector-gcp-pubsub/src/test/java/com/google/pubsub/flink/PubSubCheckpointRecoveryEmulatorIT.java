@@ -23,6 +23,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import com.google.api.gax.core.NoCredentialsProvider;
 import com.google.api.gax.grpc.GrpcTransportChannel;
@@ -31,11 +33,15 @@ import com.google.api.gax.rpc.FixedTransportChannelProvider;
 import com.google.cloud.pubsub.v1.AckReplyConsumer;
 import com.google.cloud.pubsub.v1.MessageReceiver;
 import com.google.cloud.pubsub.v1.Subscriber;
+import com.google.pubsub.flink.internal.source.enumerator.PubSubCheckpointSerializer;
+import com.google.pubsub.flink.internal.source.enumerator.PubSubReplaySnapshots;
+import com.google.pubsub.flink.internal.source.enumerator.PubSubSnapshotStore;
 import com.google.pubsub.flink.internal.source.reader.PubSubAckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubNotifyingPullSubscriber;
 import com.google.pubsub.flink.internal.source.reader.PubSubSourceReader;
 import com.google.pubsub.flink.internal.source.reader.PubSubSplitReader;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
+import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -52,6 +58,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
@@ -100,6 +107,73 @@ public class PubSubCheckpointRecoveryEmulatorIT {
             .setDeserializationSchema(
                 PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()))
             .build();
+  }
+
+  @Test(timeout = 30000)
+  public void replayCleanup_survivesSerializedRecoveryWithoutListingEveryCheckpoint()
+      throws Exception {
+    AtomicBoolean failCreate = new AtomicBoolean();
+    AtomicReference<String> ambiguous = new AtomicReference<>();
+    PubSubEnumeratorCheckpoint checkpoint;
+    PubSubCheckpointSerializer serializer = new PubSubCheckpointSerializer();
+    try (PubSubSnapshotStore original =
+        spy(
+            new PubSubSnapshotStore(
+                source.projectName(),
+                source.subscriptionName(),
+                source.credentials(),
+                source.endpoint()))) {
+      doAnswer(
+              invocation -> {
+                String created = (String) invocation.callRealMethod();
+                if (failCreate.get()) {
+                  ambiguous.set(created);
+                  throw new IllegalStateException(
+                      "Injected response loss after successful CreateSnapshot");
+                }
+                return created;
+              })
+          .when(original)
+          .create(any());
+      doAnswer(
+              invocation -> {
+                throw new IllegalStateException("Injected DeleteSnapshot outage");
+              })
+          .when(original)
+          .delete(any());
+      PubSubReplaySnapshots manager = new PubSubReplaySnapshots(original, 1);
+      var first = PubSubEnumeratorCheckpoint.newBuilder();
+      manager.snapshot(1, first);
+      manager.notifyCheckpointComplete(1);
+      failCreate.set(true);
+      var second = PubSubEnumeratorCheckpoint.newBuilder();
+      manager.snapshot(2, second);
+      checkpoint =
+          serializer.deserialize(serializer.getVersion(), serializer.serialize(second.build()));
+      manager.notifyCheckpointComplete(2);
+      assertEquals(1, checkpoint.getPendingSnapshotDeletionsCount());
+      assertTrue(original.exists(ambiguous.get()));
+      verify(original, times(1)).list();
+    }
+    try (PubSubSnapshotStore recovered =
+        spy(
+            new PubSubSnapshotStore(
+                source.projectName(),
+                source.subscriptionName(),
+                source.credentials(),
+                source.endpoint()))) {
+      PubSubReplaySnapshots manager = PubSubReplaySnapshots.restore(recovered, 1, checkpoint);
+      assertTrue(
+          "Persisted cleanup must remove the ambiguous remote create",
+          !recovered.exists(ambiguous.get()));
+      for (int id = 3; id <= 10; id++) {
+        manager.snapshot(id, PubSubEnumeratorCheckpoint.newBuilder());
+        manager.notifyCheckpointComplete(id);
+      }
+      verify(recovered, times(1)).list();
+      // This local test owns the namespace and no recovery point is retained after completion.
+      for (String name : recovered.listForSubscriptionTopic()) recovered.delete(name);
+    }
   }
 
   @Test(timeout = 30000)

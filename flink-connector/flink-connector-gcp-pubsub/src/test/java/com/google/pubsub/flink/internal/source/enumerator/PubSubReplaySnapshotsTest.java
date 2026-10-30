@@ -509,6 +509,166 @@ public class PubSubReplaySnapshotsTest {
     assertThrows(IllegalStateException.class, () -> snapshot(manager, 2));
   }
 
+  @Test
+  public void checkpointAllocation_listsNamespaceOnlyOnce() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    for (int id = 1; id <= 20; id++) {
+      snapshot(manager, id);
+      manager.notifyCheckpointComplete(id);
+    }
+    assertThat(store.listCalls).isEqualTo(1);
+  }
+
+  @Test
+  public void rollbackFullBudget_reusesOldBoundaryAndCanRefreshAfterItsExpiry() {
+    PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint six = snapshot(original, 6);
+    original.notifyCheckpointComplete(6);
+    PubSubEnumeratorCheckpoint seven = snapshot(original, 7);
+    PubSubReplaySnapshots recovered = PubSubReplaySnapshots.restore(store, 1, six);
+    int before = store.creates;
+    for (int id = 8; id <= 27; id++) {
+      assertThat(name(snapshot(recovered, id))).isEqualTo(name(six));
+      recovered.notifyCheckpointComplete(id);
+    }
+    assertThat(store.creates).isEqualTo(before);
+    store.expired.add(name(six));
+    PubSubEnumeratorCheckpoint fresh = snapshot(recovered, 28);
+    assertThat(name(fresh)).isNotEqualTo(name(six));
+    assertThat(store.resources).containsExactly(name(seven), name(fresh));
+  }
+
+  @Test
+  public void persistedPendingDeletion_isRetriedAfterRestart() throws Exception {
+    PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(original, 1);
+    original.notifyCheckpointComplete(1);
+    store.failAfterCreate = true;
+    PubSubEnumeratorCheckpoint second = snapshot(original, 2);
+    String ambiguous =
+        store.resources.stream()
+            .filter(value -> !value.equals(name(first)))
+            .findFirst()
+            .orElseThrow();
+    store.failedDeletions.add(ambiguous);
+    original.notifyCheckpointComplete(2);
+    PubSubCheckpointSerializer serializer = new PubSubCheckpointSerializer();
+    second = serializer.deserialize(serializer.getVersion(), serializer.serialize(second));
+    store.failAfterCreate = false;
+    PubSubReplaySnapshots restored = PubSubReplaySnapshots.restore(store, 1, second);
+    assertThat(store.resources).contains(ambiguous);
+    PubSubEnumeratorCheckpoint third = snapshot(restored, 3);
+    third = serializer.deserialize(serializer.getVersion(), serializer.serialize(third));
+    assertThat(third.getPendingSnapshotDeletionsCount()).isEqualTo(1);
+    store.failedDeletions.clear();
+    PubSubReplaySnapshots.restore(store, 1, third);
+    assertThat(store.resources).doesNotContain(ambiguous);
+    assertThat(store.resources).contains(name(first));
+  }
+
+  @Test
+  public void rollbackExpiredBoundary_cannotBeRestored() {
+    PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint six = snapshot(original, 6);
+    original.notifyCheckpointComplete(6);
+    snapshot(original, 7);
+    PubSubReplaySnapshots recovered = PubSubReplaySnapshots.restore(store, 1, six);
+    PubSubEnumeratorCheckpoint reused = snapshot(recovered, 8);
+    assertThat(name(reused)).isEqualTo(name(six));
+    recovered.notifyCheckpointComplete(8);
+    store.expired.add(name(six));
+
+    IllegalStateException failure =
+        assertThrows(
+            IllegalStateException.class, () -> PubSubReplaySnapshots.restore(store, 1, reused));
+    assertThat(failure).hasMessageThat().contains("missing or expired");
+  }
+
+  @Test
+  public void ambiguousCreateBeforeDurableCheckpoint_isPreservedAsUnknownOnRestore() {
+    PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint durable = snapshot(original, 1);
+    original.notifyCheckpointComplete(1);
+    store.failAfterCreate = true;
+    snapshot(original, 2); // A crash occurs before this state becomes durable.
+    String ambiguous =
+        store.resources.stream()
+            .filter(value -> !value.equals(name(durable)))
+            .findFirst()
+            .orElseThrow();
+    store.failAfterCreate = false;
+
+    PubSubReplaySnapshots recovered = PubSubReplaySnapshots.restore(store, 1, durable);
+    assertThat(store.resources).containsExactly(name(durable), ambiguous);
+    int creates = store.creates;
+    assertThat(name(snapshot(recovered, 3))).isEqualTo(name(durable));
+    assertThat(store.creates).isEqualTo(creates);
+    assertThat(store.resources).contains(ambiguous);
+  }
+
+  @Test
+  public void restore_rejectsUnsafePendingDeletionsBeforeSeekingOrDeleting() {
+    PubSubEnumeratorCheckpoint first = snapshot(new PubSubReplaySnapshots(store, 2), 1);
+    String namespace = first.getReplaySnapshotNamespace();
+    String candidate = "flink-" + namespace + "-" + "a".repeat(32);
+    for (String unsafe :
+        List.of(
+            name(first), // A full or short alias of a retained boundary must never be deleted.
+            name(first).substring(name(first).lastIndexOf('/') + 1),
+            "projects/other/snapshots/" + candidate,
+            "projects/project/snapshots/flink-" + "b".repeat(32) + "-" + "c".repeat(32),
+            "projects/project/snapshots/" + candidate + "/extra",
+            "")) {
+      PubSubEnumeratorCheckpoint corrupt =
+          first.toBuilder().addPendingSnapshotDeletions(unsafe).build();
+      assertThrows(
+          IllegalArgumentException.class, () -> PubSubReplaySnapshots.restore(store, 2, corrupt));
+      assertThat(store.seeks).isEmpty();
+      assertThat(store.resources).containsExactly(name(first));
+    }
+  }
+
+  @Test
+  public void failedRestoreSeek_doesNotResolvePersistedPendingDeletions() {
+    PubSubReplaySnapshots manager = new PubSubReplaySnapshots(store, 2);
+    PubSubEnumeratorCheckpoint first = snapshot(manager, 1);
+    manager.notifyCheckpointComplete(1);
+    String candidate =
+        "projects/project/snapshots/flink-"
+            + first.getReplaySnapshotNamespace()
+            + "-"
+            + "d".repeat(32);
+    store.resources.add(candidate);
+    PubSubEnumeratorCheckpoint checkpoint =
+        first.toBuilder().addPendingSnapshotDeletions(candidate).build();
+    store.failSeek = true;
+    assertThrows(
+        IllegalStateException.class, () -> PubSubReplaySnapshots.restore(store, 2, checkpoint));
+    assertThat(store.resources).containsExactly(name(first), candidate);
+    store.failSeek = false;
+    PubSubReplaySnapshots.restore(store, 2, checkpoint);
+    assertThat(store.resources).containsExactly(name(first));
+  }
+
+  @Test
+  public void reviewedOfflineCleanupAndRestart_refreshesNamespaceBudget() {
+    PubSubReplaySnapshots original = new PubSubReplaySnapshots(store, 1);
+    PubSubEnumeratorCheckpoint first = snapshot(original, 1);
+    original.notifyCheckpointComplete(1);
+    PubSubEnumeratorCheckpoint newer = snapshot(original, 2);
+    PubSubReplaySnapshots recovered = PubSubReplaySnapshots.restore(store, 1, first);
+    assertThat(name(snapshot(recovered, 3))).isEqualTo(name(first));
+    // The operator stops the coordinator, abandons the newer recovery point, and reviews cleanup.
+    recovered.close();
+    store.delete(name(newer));
+    int listsBeforeRestart = store.listCalls;
+    PubSubReplaySnapshots restarted = PubSubReplaySnapshots.restore(store, 1, first);
+    assertThat(store.listCalls).isEqualTo(listsBeforeRestart + 1);
+    PubSubEnumeratorCheckpoint fresh = snapshot(restarted, 4);
+    assertThat(name(fresh)).isNotEqualTo(name(first));
+    assertThat(store.listCalls).isEqualTo(listsBeforeRestart + 1);
+  }
+
   private static PubSubEnumeratorCheckpoint snapshot(PubSubReplaySnapshots manager, long id) {
     PubSubEnumeratorCheckpoint.Builder checkpoint = PubSubEnumeratorCheckpoint.newBuilder();
     manager.snapshot(id, checkpoint);
@@ -534,6 +694,7 @@ public class PubSubReplaySnapshotsTest {
     boolean failSeek;
     boolean closed;
     int creates;
+    int listCalls;
 
     @Override
     public String create(String name) {
@@ -567,12 +728,19 @@ public class PubSubReplaySnapshotsTest {
     }
 
     @Override
+    public boolean exists(String name) {
+      // Production uses GetSnapshot, not a project-wide list, for this lookup.
+      return resources.contains(fullName(name));
+    }
+
+    @Override
     public long expiryMillis(String name) {
       return expired.contains(name) ? 1 : expiries.getOrDefault(name, Long.MAX_VALUE);
     }
 
     @Override
     public Iterable<String> list() {
+      listCalls++;
       return new ArrayList<>(resources);
     }
 
