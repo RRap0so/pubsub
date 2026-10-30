@@ -17,19 +17,25 @@ package com.google.pubsub.flink.internal.sink;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.api.core.ApiFutures;
 import com.google.api.core.SettableApiFuture;
 import com.google.cloud.pubsub.v1.Publisher;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.protobuf.ByteString;
 import com.google.pubsub.v1.PubsubMessage;
 import java.io.IOException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -44,6 +50,130 @@ public class PubSubFlushablePublisherTest {
   @Before
   public void doBeforeEachTest() {
     flushablePublisher = new PubSubFlushablePublisher(mockPublisher);
+  }
+
+  @Test
+  public void close_shutdownIgnoringInterruptsDoesNotBlockCallerOrStartAnotherWorker()
+      throws Exception {
+    CountDownLatch shutdownEntered = new CountDownLatch(1);
+    CountDownLatch releaseShutdown = new CountDownLatch(1);
+    AtomicReference<Thread> shutdownThread = new AtomicReference<>();
+    doAnswer(
+            invocation -> {
+              shutdownThread.set(Thread.currentThread());
+              shutdownEntered.countDown();
+              Uninterruptibles.awaitUninterruptibly(releaseShutdown);
+              return null;
+            })
+        .when(mockPublisher)
+        .shutdown();
+    flushablePublisher = new PubSubFlushablePublisher(mockPublisher, 100, TimeUnit.MILLISECONDS);
+    var caller = Executors.newSingleThreadExecutor();
+    try {
+      Future<IOException> close =
+          caller.submit(() -> assertThrows(IOException.class, flushablePublisher::close));
+      assertThat(shutdownEntered.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(close.get(2, TimeUnit.SECONDS))
+          .hasCauseThat()
+          .isInstanceOf(TimeoutException.class);
+      assertThat(shutdownThread.get().isDaemon()).isTrue();
+      caller
+          .submit(
+              () -> {
+                flushablePublisher.close();
+                return null;
+              })
+          .get(2, TimeUnit.SECONDS);
+      verify(mockPublisher, times(1)).shutdown();
+      assertThrows(
+          IllegalStateException.class,
+          () -> flushablePublisher.publish(PubsubMessage.getDefaultInstance()));
+    } finally {
+      releaseShutdown.countDown();
+      caller.shutdownNow();
+      assertThat(caller.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+      if (shutdownThread.get() != null) {
+        shutdownThread.get().join(5000);
+        assertThat(shutdownThread.get().isAlive()).isFalse();
+      }
+    }
+  }
+
+  @Test
+  public void close_unfinishedPublishIsBoundedAndStillAttemptsShutdown() throws Exception {
+    PubsubMessage message = PubsubMessage.getDefaultInstance();
+    SettableApiFuture<String> publish = SettableApiFuture.create();
+    when(mockPublisher.publish(message)).thenReturn(publish);
+    CountDownLatch shutdownEntered = new CountDownLatch(1);
+    AtomicReference<Thread> shutdownThread = new AtomicReference<>();
+    doAnswer(
+            invocation -> {
+              shutdownThread.set(Thread.currentThread());
+              shutdownEntered.countDown();
+              return null;
+            })
+        .when(mockPublisher)
+        .shutdown();
+    flushablePublisher = new PubSubFlushablePublisher(mockPublisher, 100, TimeUnit.MILLISECONDS);
+    flushablePublisher.publish(message);
+    var caller = Executors.newSingleThreadExecutor();
+    try {
+      Future<IOException> close =
+          caller.submit(() -> assertThrows(IOException.class, flushablePublisher::close));
+      assertThat(close.get(2, TimeUnit.SECONDS))
+          .hasCauseThat()
+          .isInstanceOf(TimeoutException.class);
+      assertThat(shutdownEntered.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(publish.isCancelled()).isFalse();
+    } finally {
+      publish.set("ack-id");
+      caller.shutdownNow();
+      assertThat(caller.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(shutdownEntered.await(5, TimeUnit.SECONDS)).isTrue();
+      shutdownThread.get().join(5000);
+      assertThat(shutdownThread.get().isAlive()).isFalse();
+    }
+  }
+
+  @Test
+  public void close_callerInterruptionDoesNotWaitForUninterruptibleShutdown() throws Exception {
+    CountDownLatch shutdownEntered = new CountDownLatch(1);
+    CountDownLatch releaseShutdown = new CountDownLatch(1);
+    AtomicReference<Thread> callerThread = new AtomicReference<>();
+    AtomicReference<Thread> shutdownThread = new AtomicReference<>();
+    doAnswer(
+            invocation -> {
+              shutdownThread.set(Thread.currentThread());
+              shutdownEntered.countDown();
+              Uninterruptibles.awaitUninterruptibly(releaseShutdown);
+              return null;
+            })
+        .when(mockPublisher)
+        .shutdown();
+    var caller = Executors.newSingleThreadExecutor();
+    try {
+      Future<IOException> close =
+          caller.submit(
+              () -> {
+                callerThread.set(Thread.currentThread());
+                IOException failure = assertThrows(IOException.class, flushablePublisher::close);
+                assertThat(Thread.currentThread().isInterrupted()).isTrue();
+                return failure;
+              });
+      assertThat(shutdownEntered.await(5, TimeUnit.SECONDS)).isTrue();
+      callerThread.get().interrupt();
+      assertThat(close.get(2, TimeUnit.SECONDS))
+          .hasCauseThat()
+          .isInstanceOf(InterruptedException.class);
+    } finally {
+      releaseShutdown.countDown();
+      caller.shutdownNow();
+      assertThat(caller.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+      if (shutdownThread.get() != null) {
+        shutdownThread.get().join(5000);
+        assertThat(shutdownThread.get().isAlive()).isFalse();
+      }
+    }
   }
 
   @Test
@@ -179,13 +309,13 @@ public class PubSubFlushablePublisherTest {
   }
 
   @Test
-  public void close_shutdownWaitInterruptionPreservesFlag() throws Exception {
+  public void close_workerInterruptionDoesNotInterruptCaller() throws Exception {
     when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS))
         .thenThrow(new InterruptedException("shutdown interrupted"));
     try {
       IOException failure = assertThrows(IOException.class, flushablePublisher::close);
       assertThat(failure).hasCauseThat().isInstanceOf(InterruptedException.class);
-      assertThat(Thread.currentThread().isInterrupted()).isTrue();
+      assertThat(Thread.currentThread().isInterrupted()).isFalse();
       verify(mockPublisher).shutdown();
     } finally {
       Thread.interrupted();
@@ -193,21 +323,29 @@ public class PubSubFlushablePublisherTest {
   }
 
   @Test
-  public void close_interruptedFlushStillAttemptsShutdown() throws Exception {
+  public void close_interruptedCallerStillStartsShutdown() throws Exception {
     PubsubMessage message = PubsubMessage.getDefaultInstance();
     when(mockPublisher.publish(message)).thenReturn(SettableApiFuture.create());
-    when(mockPublisher.awaitTermination(30, TimeUnit.SECONDS)).thenReturn(true);
+    CountDownLatch terminated = new CountDownLatch(1);
+    doAnswer(
+            invocation -> {
+              terminated.countDown();
+              return true;
+            })
+        .when(mockPublisher)
+        .awaitTermination(30, TimeUnit.SECONDS);
     flushablePublisher.publish(message);
     try {
       Thread.currentThread().interrupt();
       IOException failure = assertThrows(IOException.class, flushablePublisher::close);
       assertThat(failure).hasCauseThat().isInstanceOf(InterruptedException.class);
       assertThat(Thread.currentThread().isInterrupted()).isTrue();
-      verify(mockPublisher).shutdown();
-      verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
     } finally {
       Thread.interrupted();
     }
+    assertThat(terminated.await(5, TimeUnit.SECONDS)).isTrue();
+    verify(mockPublisher).shutdown();
+    verify(mockPublisher).awaitTermination(30, TimeUnit.SECONDS);
   }
 
   @Test

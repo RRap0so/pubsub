@@ -24,15 +24,26 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class PubSubFlushablePublisher implements FlushablePublisher {
   private final Publisher publisher;
   private final List<ApiFuture<String>> outstandingPublishes = new ArrayList<>();
+  private final long closeTimeoutNanos;
   private boolean closed;
 
   public PubSubFlushablePublisher(Publisher publisher) {
+    this(publisher, 30, TimeUnit.SECONDS);
+  }
+
+  PubSubFlushablePublisher(Publisher publisher, long closeTimeout, TimeUnit unit) {
+    if (closeTimeout <= 0) {
+      throw new IllegalArgumentException("Close timeout must be positive");
+    }
     this.publisher = publisher;
+    this.closeTimeoutNanos = unit.toNanos(closeTimeout);
   }
 
   @Override
@@ -60,11 +71,50 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   }
 
   @Override
-  public void close() throws IOException {
+  public synchronized void close() throws IOException {
     if (closed) {
       return;
     }
     closed = true;
+    FutureTask<Void> cleanup =
+        new FutureTask<>(
+            () -> {
+              closePublisher();
+              return null;
+            });
+    Thread worker = new Thread(cleanup, "pubsub-publisher-close");
+    // SDK shutdown can ignore interruption while draining retries. Bound the caller's entire
+    // close, including flush, without making task cancellation wait for those SDK retries.
+    worker.setDaemon(true);
+    worker.start();
+    try {
+      cleanup.get(closeTimeoutNanos, TimeUnit.NANOSECONDS);
+    } catch (TimeoutException timedOut) {
+      worker.interrupt();
+      throw new IOException(
+          "Pub/Sub publisher close did not finish within "
+              + TimeUnit.NANOSECONDS.toMillis(closeTimeoutNanos)
+              + " ms",
+          timedOut);
+    } catch (InterruptedException interrupted) {
+      // Interrupt the thread rather than cancelling the FutureTask: even if the worker has not
+      // started running yet, it must still execute its shutdown finally block.
+      worker.interrupt();
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted while closing Pub/Sub publisher", interrupted);
+    } catch (ExecutionException failed) {
+      Throwable cause = failed.getCause();
+      if (cause instanceof IOException) {
+        throw (IOException) cause;
+      }
+      if (cause instanceof Error) {
+        throw (Error) cause;
+      }
+      throw new IOException("Unable to close Pub/Sub publisher", cause);
+    }
+  }
+
+  private void closePublisher() throws IOException {
     IOException failure = null;
     try {
       flush();
@@ -90,7 +140,8 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
 
   private void shutdownPublisher() throws IOException {
     try {
-      // SDK shutdown itself drains pending requests. Bound the subsequent resource wait.
+      // shutdown() itself may wait uninterruptibly. Both it and this termination wait run on
+      // the daemon worker; close() bounds how long the task thread waits for the whole operation.
       publisher.shutdown();
       if (!publisher.awaitTermination(30, TimeUnit.SECONDS)) {
         throw new IOException("Pub/Sub publisher did not terminate within 30 seconds");
