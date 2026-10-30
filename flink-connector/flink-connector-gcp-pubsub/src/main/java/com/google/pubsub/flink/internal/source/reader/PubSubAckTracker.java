@@ -70,22 +70,29 @@ public class PubSubAckTracker implements AckTracker {
   private final SortedMap<Long, List<String>> checkpoints = new TreeMap<>();
 
   @Override
-  public synchronized boolean trackMessageDelivery(
-      String messageId, AckReplyConsumer ackReplyConsumer) {
-    Delivery delivery = outstandingAcks.get(messageId);
-    boolean firstDelivery = delivery == null;
-    if (firstDelivery) {
-      outstandingAcks.put(messageId, new Delivery(ackReplyConsumer, nanoTime.getAsLong()));
-      pendingAcks.add(messageId);
-    } else {
+  public boolean trackMessageDelivery(String messageId, AckReplyConsumer ackReplyConsumer) {
+    AckReplyConsumer previousConsumer;
+    synchronized (this) {
+      Delivery delivery = outstandingAcks.get(messageId);
+      if (delivery == null) {
+        outstandingAcks.put(messageId, new Delivery(ackReplyConsumer, nanoTime.getAsLong()));
+        pendingAcks.add(messageId);
+        return true;
+      }
+      previousConsumer = delivery.consumer;
       delivery.consumer = ackReplyConsumer;
       redeliveries.inc();
     }
-    return firstDelivery;
+    // Each delivery owns SDK flow-control capacity and lease extensions. Retain only the newest
+    // handle for checkpoint acknowledgement, and release the old one without holding our lock.
+    if (previousConsumer != ackReplyConsumer) {
+      previousConsumer.nack();
+    }
+    return false;
   }
 
   @Override
-  public synchronized void addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer) {
+  public void addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer) {
     trackMessageDelivery(messageId, ackReplyConsumer);
   }
 

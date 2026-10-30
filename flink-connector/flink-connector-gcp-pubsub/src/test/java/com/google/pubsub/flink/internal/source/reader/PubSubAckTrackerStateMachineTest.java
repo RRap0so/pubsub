@@ -54,6 +54,9 @@ public class PubSubAckTrackerStateMachineTest {
           String token = "delivery-" + step;
           boolean first = !records.containsKey(id);
           Record record = records.computeIfAbsent(id, unused -> new Record());
+          if (!first) {
+            expected.merge("nack:" + record.delivery, 1, Integer::sum);
+          }
           record.delivery = token;
           assertEquals(
               context + " first delivery",

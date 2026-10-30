@@ -87,11 +87,16 @@ public class PubSubNotifyingPullSubscriberTest {
             },
             tracker);
     PubsubMessage message = PubsubMessage.newBuilder().setMessageId("message-id").build();
-    receiver.receiveMessage(message, mock(AckReplyConsumer.class));
-    receiver.receiveMessage(message, mock(AckReplyConsumer.class));
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer latest = mock(AckReplyConsumer.class);
+    receiver.receiveMessage(message, original);
+    receiver.receiveMessage(message, latest);
 
     assertThat(subscriber.pullMessage().get()).isEqualTo(message);
     assertThat(subscriber.pullMessage().isPresent()).isFalse();
+    verify(original).nack();
+    tracker.nackAll();
+    verify(latest).nack();
   }
 
   @Test
