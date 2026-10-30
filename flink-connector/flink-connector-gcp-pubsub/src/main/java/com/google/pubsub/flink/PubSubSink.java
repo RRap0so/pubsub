@@ -50,6 +50,9 @@ import org.apache.flink.api.connector.sink2.WriterInitContext;
  */
 @AutoValue
 public abstract class PubSubSink<T> implements Sink<T> {
+  private static final int PUBLISHER_THREADS = 2;
+  private static final int CALLBACK_THREADS = 2;
+
   public abstract String projectName();
 
   public abstract String topicName();
@@ -109,13 +112,19 @@ public abstract class PubSubSink<T> implements Sink<T> {
   }
 
   ScheduledExecutorService createExecutor() {
-    var defaults = TopicAdminSettings.defaultExecutorProviderBuilder().build();
+    var defaults =
+        TopicAdminSettings.defaultExecutorProviderBuilder()
+            .setExecutorThreadCount(PUBLISHER_THREADS)
+            .build();
     return new PubSubPublisherExecutor(
         defaults.getExecutorThreadCount(), defaults.getThreadFactory());
   }
 
   ScheduledExecutorService createCallbackExecutor() {
-    return TopicAdminSettings.defaultExecutorProviderBuilder().build().getExecutor();
+    return TopicAdminSettings.defaultExecutorProviderBuilder()
+        .setExecutorThreadCount(CALLBACK_THREADS)
+        .build()
+        .getExecutor();
   }
 
   InstantiatingGrpcChannelProvider createChannelProvider(String emulatorEndpoint) {
