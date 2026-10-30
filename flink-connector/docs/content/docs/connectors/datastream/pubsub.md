@@ -13,7 +13,7 @@ Prerequisites:
 *   Unix-like environment (we use Linux, Mac OS X)
 *   Git
 *   Maven (we recommend version 3.8.6)
-*   Java 11
+*   Java 17
 
 ```sh
 git clone https://github.com/GoogleCloudPlatform/pubsub.git
@@ -138,20 +138,94 @@ For at-least-once replay from retained checkpoints and savepoints, explicitly se
 `PubSubSource.<OutputT>builder().setReplaySnapshotRetentionCount(count)` with a
 positive count. The coordinator captures a Pub/Sub snapshot before the readers'
 checkpoint barriers and stores its reference in checkpoint state. Restore seeks
-to that snapshot before assigning readers. Missing or expired snapshots fail
+to that snapshot before a coordinator readiness event permits restored readers to start pulling. Missing or expired snapshots fail
 recovery rather than silently skipping input.
 
 This option is disabled by default and requires a dedicated subscription and
-snapshot administration permissions. It retains the last `count` provider
-snapshot boundaries at or before the newest completed checkpoint, plus one shared
-pending boundary. Checkpoints and savepoints can reference the same earlier
-snapshot while completion is pending, including when a savepoint has no completion
-notification. This keeps provider snapshots bounded by `count + 1` without blocking
-the next checkpoint. Recovery from a shared boundary may replay additional input.
-Older savepoints outside this window cannot be restored. Pub/Sub bills retained
-snapshot data separately; snapshots survive job shutdown and abandoned jobs
-require independent cleanup. Replay can duplicate records already represented
-in Flink state and does not provide exactly-once state semantics.
+snapshot create, get, list, delete, and seek permissions. It retains the last
+`count` completed provider boundaries plus one shared pending boundary. Savepoints
+without completion notifications can share an earlier boundary.
+
+Restore preserves unreferenced snapshots because they may belong to newer completed
+savepoints. Those resources remain until provider expiry or explicit reviewed cleanup.
+They and pending deletions count toward the namespace's `count + 1` resource budget.
+If that budget is full, a checkpoint reuses a valid known boundary rather than creating
+another resource. Restarts therefore cannot evade the resource budget.
+
+Failed deletes are queued, logged, and retried without failing checkpoint completion.
+If creating a new snapshot fails, an existing unexpired boundary can be reused to
+allow checkpoint ACKs and backlog drainage. Recovery may consequently replay more
+input. A missing or expired boundary is never used as a fallback. If no safe boundary
+exists (including the first checkpoint of an old backlog), checkpointing fails rather
+than claiming replay protection that was never established.
+
+Older checkpoints outside the retained window cannot be restored. Pub/Sub bills retained
+snapshot data separately. Replay is at least once and may duplicate records represented
+in Flink state; the opt-in helper below suppresses provider-message-ID duplicates.
+
+### Checkpointed replay deduplication
+
+`PubSubReplayDeduplication.read` adds a keyed, checkpointed message-ID index before
+user deserialization. For example:
+
+```java
+env.enableCheckpointing(10_000);
+env.setMaxParallelism(128); // Keep this value stable across restores and rescaling.
+PubSubSource<String> source = PubSubSource.<String>builder()
+    .setProjectName("my-project")
+    .setSubscriptionName("my-subscription")
+    .setDeserializationSchema(PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()))
+    .setReplaySnapshotRetentionCount(4)
+    .build();
+DataStream<String> input = PubSubReplayDeduplication.read(
+    env, source, WatermarkStrategy.noWatermarks(), "stable-pubsub-uid", Duration.ofDays(8));
+```
+
+Replay snapshots and exactly-once checkpoint consistency are required. Keep the UID
+prefix, operator topology, and maximum parallelism stable. Existing checkpoints without
+this stage cannot be migrated: they do not contain the message-ID index. Enabling or
+disabling deduplication when restoring existing state is rejected.
+
+Retention must be at least eight days and cover every message a retained snapshot
+might replay. TTL uses processing time since first acceptance, including downtime;
+duplicates do not extend it. Expired IDs can be emitted again. State grows with the
+number of distinct provider IDs during that period, so size the state backend and
+checkpoint storage accordingly. Separate publications of the same payload have
+different IDs. External writes still require transactions or downstream idempotency.
+
+**Ordering and event time:** this helper shuffles by provider message ID. With parallelism
+above one, messages sharing a Pub/Sub ordering key can reach different subtasks, so
+it does not preserve ordering-key order. The supplied watermark strategy runs after
+that shuffle and deserialization, rather than on the source. Its idleness therefore
+applies to the downstream watermark operator; source-split idleness and source watermark
+alignment are not provided by this helper. Pipelines requiring these semantics need a
+different topology and should not assume the helper preserves them.
+
+### Cleanup of permanently abandoned snapshots
+
+`PubSubReplaySnapshotCleanup` provides explicit cleanup for a permanently abandoned
+job. Obtain the exact namespace from that job's persisted enumerator checkpoint;
+never infer ownership from a topic or a broad prefix alone.
+
+```java
+String namespace = abandonedCheckpoint.getReplaySnapshotNamespace();
+List<String> candidates = PubSubReplaySnapshotCleanup.list(source, namespace);
+candidates.forEach(System.out::println); // Review and save the exact names first.
+```
+
+After confirming the job cannot run again and no retained checkpoint or savepoint
+needs these resources, pass only the explicitly reviewed names:
+
+```java
+PubSubReplaySnapshotCleanup.deleteReviewed(source, namespace, reviewedNames);
+```
+
+The helper checks the exact project, namespace, and subscription topic before deletion.
+The subscription must still exist for the topic check. Listing does not delete anything;
+missing resources are harmless and the same reviewed list can be retried after a partial
+failure. Snapshots created after review are not implicitly added. Cleanup cannot detect
+active jobs and must not run automatically based only on age. Deletion permanently
+removes the corresponding recovery points.
 
 ### StreamingPull Connections and Flow Control
 
@@ -288,6 +362,9 @@ redelivered by Google Cloud Pub/Sub.
 </table>
 
 ## Pub/Sub Sink
+
+Each sink writer owns a publisher and two bounded pools: two publishing/retry threads
+and two transport callback threads. Pools are not shared across writers.
 
 Closing a sink writer waits at most 30 seconds for flushing pending publishes and
 shutting down the publisher. A timeout or task-thread interruption is reported as
@@ -427,6 +504,15 @@ enable it automatically. See the
 These gauges describe local reader ownership and SDK operations, not the complete
 Pub/Sub subscription backlog or messages still buffered inside the SDK. Metrics do
 not contain message IDs, acknowledgement IDs, or payloads.
+
+### Replay coordinator diagnostics
+
+The coordinator's `pubsub` group exposes `snapshotCreateFailures`,
+`snapshotDeleteFailures`, `pendingSnapshotDeletions`, and
+`replaySnapshotTimeToExpiryMillis`. The expiry gauge is cached metadata for the
+selected replay boundary; reporters do not issue provider RPCs. Watch it when
+creation is repeatedly falling back to an older snapshot. Expiry remains a hard
+limit on recovery, even when checkpoints continue to ACK input.
 
 ## Integration Testing
 

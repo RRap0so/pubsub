@@ -56,6 +56,11 @@ public final class PubSubReplayDeduplication {
    * acknowledgements. State grows with distinct message IDs within that period; size the state
    * backend and checkpoint storage accordingly. This does not make external side effects
    * transactional or deduplicate separate publications of the same payload.
+   *
+   * <p>This topology shuffles by message ID and does not preserve Pub/Sub ordering-key order across
+   * parallel subtasks. Watermarks are assigned after the shuffle and deserialization; idleness
+   * applies to that operator, not individual source splits, and source watermark alignment is not
+   * supported by this helper.
    */
   public static <T> SingleOutputStreamOperator<T> read(
       StreamExecutionEnvironment env,
