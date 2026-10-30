@@ -115,9 +115,10 @@ public class PubSubNotifyingPullSubscriber implements NotifyingPullSubscriber {
       completeNotification(permanentError);
       return;
     }
-    ackTracker.addPendingAck(message.getMessageId(), ackReplyConsumer);
-    messages.add(message);
-    completeNotification(Optional.absent());
+    if (ackTracker.trackMessageDelivery(message.getMessageId(), ackReplyConsumer)) {
+      messages.add(message);
+      completeNotification(Optional.absent());
+    }
   }
 
   @VisibleForTesting
