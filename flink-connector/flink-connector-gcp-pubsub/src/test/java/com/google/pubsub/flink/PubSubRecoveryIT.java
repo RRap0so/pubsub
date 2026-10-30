@@ -36,6 +36,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.OpenContext;
@@ -76,6 +77,7 @@ public class PubSubRecoveryIT {
   private static final Map<String, List<String>> OUTPUT = new ConcurrentHashMap<>();
   private static final Map<String, String> COMPLETED = new ConcurrentHashMap<>();
   private static final Map<String, AtomicBoolean> FAIL_B_ONCE = new ConcurrentHashMap<>();
+  private static final Map<String, AtomicInteger> CLOSED_TASKS = new ConcurrentHashMap<>();
   @Rule public TemporaryFolder temporary = new TemporaryFolder();
   private final HttpClient http = HttpClient.newHttpClient();
   private final List<JobClient> jobs = new ArrayList<>();
@@ -101,6 +103,7 @@ public class PubSubRecoveryIT {
                 .setConfiguration(config)
                 .setNumberTaskManagers(1)
                 .setNumberSlotsPerTaskManager(2)
+                .withHaLeadershipControl()
                 .build());
     cluster.before();
   }
@@ -274,6 +277,76 @@ public class PubSubRecoveryIT {
     assertEquals(List.of("A|A", "B|A,B"), OUTPUT.get(run));
   }
 
+  @Test(timeout = 90000)
+  public void replayDeduplication_stopWithSavepointRestoresWithoutDraining() throws Exception {
+    verifyStopWithSavepoint(false);
+  }
+
+  @Test(timeout = 90000)
+  public void replayDeduplication_stopWithSavepointRestoresAfterDraining() throws Exception {
+    verifyStopWithSavepoint(true);
+  }
+
+  private void verifyStopWithSavepoint(boolean drain) throws Exception {
+    String firstRun = runId();
+    JobClient original = startJob(firstRun, null, false, 2, 2, true);
+    publish("A");
+    await(() -> OUTPUT.get(firstRun).contains("A|A"), "A accepted before deployment stop");
+    String savepoint =
+        original
+            .stopWithSavepoint(drain, savepointDir(), SavepointFormatType.CANONICAL)
+            .get(20, TimeUnit.SECONDS);
+    original.getJobExecutionResult().get(20, TimeUnit.SECONDS);
+    jobs.remove(original);
+
+    String secondRun = runId();
+    JobClient restored = startJob(secondRun, savepoint, false, 2, 1, true);
+    publish("C");
+    await(() -> OUTPUT.get(secondRun).contains("C|A,C"), "new input after deployment restore");
+    await(() -> duplicateDrops(restored) >= 1, "stopped job's A replayed and suppressed");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(restored.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cancel(restored);
+    assertSubscriptionDrained();
+    assertEquals(List.of("C|A,C"), OUTPUT.get(secondRun));
+  }
+
+  @Test(timeout = 90000)
+  public void replayDeduplication_jobMasterLeadershipLossRecoversCheckpointAndPendingInput()
+      throws Exception {
+    String run = runId();
+    JobClient job = startJob(run, null, false, 2, 2, true);
+    publish("A");
+    await(() -> OUTPUT.get(run).contains("A|A"), "A processed before leadership loss");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(job.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    var leadership = cluster.getMiniCluster().getHaLeadershipControl().orElseThrow();
+    // Revoke the JobMaster itself, rather than injecting another task failure. The embedded HA
+    // service retains the completed checkpoint while the old JobMaster and its readers shut down.
+    leadership.revokeJobMasterLeadership(job.getJobID()).get(20, TimeUnit.SECONDS);
+    try {
+      await(() -> CLOSED_TASKS.get(run).get() == 2, "old JobMaster's business tasks stopped");
+      publish("B");
+    } finally {
+      leadership.grantJobMasterLeadership(job.getJobID()).get(20, TimeUnit.SECONDS);
+    }
+    await(() -> OUTPUT.get(run).contains("B|A,B"), "B processed after JobMaster re-election");
+    // This can be snapshot replay or ordinary redelivery if the checkpoint completion notice
+    // was lost. The older-savepoint tests independently prove recovery of acknowledged input.
+    await(() -> duplicateDrops(job) >= 1, "A redelivered and suppressed after leadership recovery");
+    cluster
+        .getClusterClient()
+        .triggerCheckpoint(job.getJobID(), CheckpointType.FULL)
+        .get(20, TimeUnit.SECONDS);
+    cancel(job);
+    assertSubscriptionDrained();
+    assertEquals(List.of("A|A", "B|A,B"), OUTPUT.get(run));
+  }
+
   private void verifyDeduplication(int restoredParallelism) throws Exception {
     String firstRun = runId();
     JobClient original = startJob(firstRun, null, false, 2, 1, true);
@@ -335,6 +408,11 @@ public class PubSubRecoveryIT {
     @Override
     public void open(OpenContext context) throws Exception {
       session = getRuntimeContext().getState(new ValueStateDescriptor<>("session", Types.STRING));
+    }
+
+    @Override
+    public void close() {
+      CLOSED_TASKS.get(run).incrementAndGet();
     }
 
     @Override
@@ -475,6 +553,7 @@ public class PubSubRecoveryIT {
     String run = UUID.randomUUID().toString();
     runs.add(run);
     OUTPUT.put(run, new CopyOnWriteArrayList<>());
+    CLOSED_TASKS.put(run, new AtomicInteger());
     return run;
   }
 
@@ -559,6 +638,7 @@ public class PubSubRecoveryIT {
       OUTPUT.remove(run);
       COMPLETED.remove(run);
       FAIL_B_ONCE.remove(run);
+      CLOSED_TASKS.remove(run);
     }
   }
 }
