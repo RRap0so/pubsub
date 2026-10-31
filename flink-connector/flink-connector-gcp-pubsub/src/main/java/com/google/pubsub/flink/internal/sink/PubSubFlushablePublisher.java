@@ -25,13 +25,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.flink.annotation.Internal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -129,23 +128,21 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     }
     closed = true;
     long closeStarted = System.nanoTime();
-    AtomicBoolean detached = new AtomicBoolean();
-    AtomicBoolean reported = new AtomicBoolean();
     String topic = publisher.getTopicNameString();
     String topicId = topic == null ? "unknown" : topic.substring(topic.lastIndexOf('/') + 1);
     String workerName = "pubsub-publisher-close-" + topicId + "-" + UUID.randomUUID();
-    FutureTask<Void> cleanup =
-        new FutureTask<Void>(
+    CompletableFuture<Void> cleanup = new CompletableFuture<>();
+    Thread worker =
+        new Thread(
             () -> {
-              closePublisher(closeStarted);
-              return null;
-            }) {
-          @Override
-          protected void done() {
-            reportDetachedResult(this, detached, reported, workerName);
-          }
-        };
-    Thread worker = new Thread(cleanup, workerName);
+              try {
+                closePublisher(closeStarted);
+                cleanup.complete(null);
+              } catch (Throwable failure) {
+                cleanup.completeExceptionally(failure);
+              }
+            },
+            workerName);
     // SDK shutdown may ignore interrupts. On timeout, also abort the transport and executor
     // owned by this writer, so pending publish RPCs fail and release the SDK's shutdown waiter.
     worker.setDaemon(true);
@@ -159,12 +156,12 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
                   + TimeUnit.NANOSECONDS.toMillis(closeTimeoutNanos)
                   + " ms",
               timedOut);
-      detachCleanup(worker, cleanup, detached, reported, closeStarted, failure);
+      detachCleanup(worker, cleanup, closeStarted, failure);
       throw failure;
     } catch (InterruptedException interrupted) {
       IOException failure =
           new IOException("Interrupted while closing Pub/Sub publisher", interrupted);
-      detachCleanup(worker, cleanup, detached, reported, closeStarted, failure);
+      detachCleanup(worker, cleanup, closeStarted, failure);
       Thread.currentThread().interrupt();
       throw failure;
     } catch (ExecutionException failed) {
@@ -218,15 +215,15 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
       if (transport != null) transport.shutdown();
       if (executor != null) executor.shutdown();
       if (callbackExecutor != null) callbackExecutor.shutdown();
-      if (!publisher.awaitTermination(remainingNanos(closeStarted), TimeUnit.NANOSECONDS)
-          || (transport != null
-              && !transport.awaitTermination(remainingNanos(closeStarted), TimeUnit.NANOSECONDS))
-          || (executor != null
-              && !executor.awaitTermination(remainingNanos(closeStarted), TimeUnit.NANOSECONDS))
-          || (callbackExecutor != null
-              && !callbackExecutor.awaitTermination(
-                  remainingNanos(closeStarted), TimeUnit.NANOSECONDS))) {
-        throw new IOException("Pub/Sub publisher did not terminate within the close budget");
+      awaitTermination("publisher", publisher::awaitTermination, closeStarted);
+      if (transport != null) {
+        awaitTermination("transport", transport::awaitTermination, closeStarted);
+      }
+      if (executor != null) {
+        awaitTermination("publisher executor", executor::awaitTermination, closeStarted);
+      }
+      if (callbackExecutor != null) {
+        awaitTermination("callback executor", callbackExecutor::awaitTermination, closeStarted);
       }
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
@@ -241,21 +238,28 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   }
 
   private void detachCleanup(
-      Thread worker,
-      FutureTask<Void> cleanup,
-      AtomicBoolean detached,
-      AtomicBoolean reported,
-      long closeStarted,
-      IOException failure) {
-    detached.set(true);
+      Thread worker, CompletableFuture<Void> cleanup, long closeStarted, IOException failure) {
     LOG.warn(
         "Publisher cleanup worker {} is still draining after {} ms; aborting owned resources",
         worker.getName(),
         TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeStarted));
-    // Do not cancel the FutureTask: its shutdown finally block must run even if not started yet.
+    // Never cancel the future: the worker must still run its shutdown finally block.
     worker.interrupt();
     forceResources(failure);
-    reportDetachedResult(cleanup, detached, reported, worker.getName());
+    // Runs once, immediately if the worker already finished, otherwise when it does.
+    cleanup.whenComplete(
+        (ignored, error) -> {
+          if (error == null) {
+            LOG.info(
+                "Publisher cleanup worker {} finished after the caller stopped waiting",
+                worker.getName());
+          } else {
+            LOG.warn(
+                "Publisher cleanup worker {} failed after the caller stopped waiting",
+                worker.getName(),
+                error);
+          }
+        });
   }
 
   private void forceResources(Throwable failure) {
@@ -268,35 +272,30 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   @Internal
   public static void forceCloseResources(
       Throwable failure, TransportChannel transport, ExecutorService... executors) {
-    try {
-      if (transport != null) transport.shutdownNow();
-    } catch (RuntimeException cleanupFailure) {
-      if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
-    } finally {
-      for (ExecutorService executor : executors) {
-        try {
-          if (executor != null) executor.shutdownNow();
-        } catch (RuntimeException cleanupFailure) {
-          if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
-        }
-      }
+    if (transport != null) shutdownNow(failure, transport::shutdownNow);
+    for (ExecutorService executor : executors) {
+      if (executor != null) shutdownNow(failure, executor::shutdownNow);
     }
   }
 
-  private static void reportDetachedResult(
-      FutureTask<Void> cleanup, AtomicBoolean detached, AtomicBoolean reported, String workerName) {
-    if (!detached.get() || !cleanup.isDone() || !reported.compareAndSet(false, true)) return;
+  /** Runs one cleanup step; a failure is recorded on {@code failure} and does not stop the rest. */
+  private static void shutdownNow(Throwable failure, Runnable cleanup) {
     try {
-      cleanup.get();
-      LOG.info("Publisher cleanup worker {} finished after the caller stopped waiting", workerName);
-    } catch (ExecutionException failure) {
-      LOG.warn(
-          "Publisher cleanup worker {} failed after the caller stopped waiting",
-          workerName,
-          failure.getCause());
-    } catch (InterruptedException interrupted) {
-      Thread.currentThread().interrupt();
-      LOG.warn("Interrupted while reporting publisher cleanup worker {}", workerName, interrupted);
+      cleanup.run();
+    } catch (RuntimeException cleanupFailure) {
+      if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+    }
+  }
+
+  private interface Terminable {
+    boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException;
+  }
+
+  /** Waits for one resource within the remaining close budget. */
+  private void awaitTermination(String name, Terminable resource, long closeStarted)
+      throws IOException, InterruptedException {
+    if (!resource.awaitTermination(remainingNanos(closeStarted), TimeUnit.NANOSECONDS)) {
+      throw new IOException("Pub/Sub " + name + " did not terminate within the close budget");
     }
   }
 }
