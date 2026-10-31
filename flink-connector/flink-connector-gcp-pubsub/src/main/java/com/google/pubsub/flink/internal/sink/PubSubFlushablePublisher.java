@@ -44,6 +44,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   private final ScheduledExecutorService executor;
   private final ScheduledExecutorService callbackExecutor;
   private final List<ApiFuture<String>> outstandingPublishes = new ArrayList<>();
+  private final List<OwnedResource> owned = new ArrayList<>();
   private final long closeTimeoutNanos;
   private volatile boolean closed;
 
@@ -84,6 +85,18 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     this.executor = executor;
     this.callbackExecutor = callbackExecutor;
     this.closeTimeoutNanos = unit.toNanos(closeTimeout);
+    if (transport != null) {
+      owned.add(new OwnedResource("transport", transport::shutdown, transport::awaitTermination));
+    }
+    if (executor != null) {
+      owned.add(
+          new OwnedResource("publisher executor", executor::shutdown, executor::awaitTermination));
+    }
+    if (callbackExecutor != null) {
+      owned.add(
+          new OwnedResource(
+              "callback executor", callbackExecutor::shutdown, callbackExecutor::awaitTermination));
+    }
   }
 
   @Override
@@ -121,22 +134,8 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     }
     closed = true;
     long closeStarted = System.nanoTime();
-    String workerName = "pubsub-publisher-close-" + publisher.getTopicNameString();
     CompletableFuture<Void> cleanup = new CompletableFuture<>();
-    Thread worker =
-        new Thread(
-            () -> {
-              try {
-                closePublisher(closeStarted);
-                cleanup.complete(null);
-              } catch (Throwable failure) {
-                cleanup.completeExceptionally(failure);
-              }
-            },
-            workerName);
-    // Publisher.shutdown() ignores interrupts, so close waits on a worker with a deadline.
-    worker.setDaemon(true);
-    worker.start();
+    Thread worker = startCleanupWorker(cleanup, closeStarted);
     try {
       cleanup.get(remainingNanos(closeStarted), TimeUnit.NANOSECONDS);
     } catch (TimeoutException timedOut) {
@@ -145,9 +144,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
           cleanup,
           closeStarted,
           new IOException(
-              "Pub/Sub publisher close did not finish within "
-                  + TimeUnit.NANOSECONDS.toMillis(closeTimeoutNanos)
-                  + " ms",
+              "Pub/Sub publisher close did not finish within " + closeTimeoutMillis() + " ms",
               timedOut));
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
@@ -163,6 +160,28 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
       Throwables.throwIfInstanceOf(cause, Error.class);
       throw new IOException("Unable to close Pub/Sub publisher", cause);
     }
+  }
+
+  // Publisher.shutdown() ignores interrupts, so close waits on a worker with a deadline.
+  private Thread startCleanupWorker(CompletableFuture<Void> cleanup, long closeStarted) {
+    Thread worker =
+        new Thread(
+            () -> {
+              try {
+                closePublisher(closeStarted);
+                cleanup.complete(null);
+              } catch (Throwable failure) {
+                cleanup.completeExceptionally(failure);
+              }
+            },
+            "pubsub-publisher-close-" + publisher.getTopicNameString());
+    worker.setDaemon(true);
+    worker.start();
+    return worker;
+  }
+
+  private long closeTimeoutMillis() {
+    return TimeUnit.NANOSECONDS.toMillis(closeTimeoutNanos);
   }
 
   private void closePublisher(long closeStarted) throws IOException {
@@ -207,18 +226,10 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   private void shutdownPublisher(long closeStarted) throws IOException {
     try {
       publisher.shutdown();
-      if (transport != null) transport.shutdown();
-      if (executor != null) executor.shutdown();
-      if (callbackExecutor != null) callbackExecutor.shutdown();
+      for (OwnedResource resource : owned) resource.shutdown.run();
       awaitTermination("publisher", publisher::awaitTermination, closeStarted);
-      if (transport != null) {
-        awaitTermination("transport", transport::awaitTermination, closeStarted);
-      }
-      if (executor != null) {
-        awaitTermination("publisher executor", executor::awaitTermination, closeStarted);
-      }
-      if (callbackExecutor != null) {
-        awaitTermination("callback executor", callbackExecutor::awaitTermination, closeStarted);
+      for (OwnedResource resource : owned) {
+        awaitTermination(resource.name, resource.await, closeStarted);
       }
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
@@ -290,6 +301,18 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
 
   private interface Terminable {
     boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException;
+  }
+
+  private static final class OwnedResource {
+    final String name;
+    final Runnable shutdown;
+    final Terminable await;
+
+    OwnedResource(String name, Runnable shutdown, Terminable await) {
+      this.name = name;
+      this.shutdown = shutdown;
+      this.await = await;
+    }
   }
 
   private void awaitTermination(String name, Terminable resource, long closeStarted)
