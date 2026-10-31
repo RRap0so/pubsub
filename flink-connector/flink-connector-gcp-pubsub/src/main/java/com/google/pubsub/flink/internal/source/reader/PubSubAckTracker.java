@@ -169,7 +169,8 @@ public class PubSubAckTracker implements AckTracker {
     }
 
     int size() {
-      return consumers != null ? consumers.size() : only != null ? 1 : 0;
+      if (consumers != null) return consumers.size();
+      return only == null ? 0 : 1;
     }
 
     void add(AckReplyConsumer consumer) {
