@@ -82,9 +82,7 @@ public class PubSubAckTracker implements AckTracker {
       pendingAcks.add(messageId);
       return true;
     }
-    // Old ACK IDs can still affect the current lease on standard subscriptions. NACKing one
-    // here can create a redelivery loop, and ACKing it would precede checkpoint completion.
-    // Keep every handle until checkpoint ACK or shutdown NACK releases its SDK flow-control slot.
+    // Keep every handle until checkpoint or shutdown; see AckTracker#addPendingAck.
     delivery.add(ackReplyConsumer);
     redeliveries.inc();
     return false;
@@ -112,9 +110,7 @@ public class PubSubAckTracker implements AckTracker {
       try {
         for (String messageId : messages) {
           Delivery delivery = outstandingAcks.get(messageId);
-          // Keep ownership until the callback returns. On failure, shutdown can still nack
-          // remaining handles, or a later completion can retry them. Each successful handle is
-          // removed immediately, so a partial failure never acknowledges it twice.
+          // Remove each handle only after its ack succeeds, so a retry never acks it twice.
           delivery.resolve(true);
           outstandingAcks.remove(messageId);
           acknowledged++;
@@ -123,7 +119,6 @@ public class PubSubAckTracker implements AckTracker {
         checkpointAckFailures.inc();
         throw failure;
       } finally {
-        // Discard the successful prefix in one linear operation, including after partial failure.
         messages.subList(0, acknowledged).clear();
       }
       checkpoints.remove(completed);
@@ -182,8 +177,7 @@ public class PubSubAckTracker implements AckTracker {
 
     void add(AckReplyConsumer consumer) {
       if (!handles.add(consumer)) {
-        // A caller may present the same handle again, including after another delivery. Keep
-        // its newest position without resolving the same SDK handle more than once.
+        // The same handle can arrive again; keep one copy at its newest position.
         consumers.removeIf(existing -> existing == consumer);
       }
       consumers.addFirst(consumer);

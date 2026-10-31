@@ -35,11 +35,7 @@ import org.apache.flink.annotation.Internal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * Publisher owned by one sink writer. Flink serializes write, flush, and close on the task thread.
- * Close hands the outstanding-publish list to a cleanup worker; callers must not use this instance
- * afterward. This class does not support concurrent publishing and flushing.
- */
+/** Publisher owned by one sink writer. Not thread-safe, and not usable after close. */
 public class PubSubFlushablePublisher implements FlushablePublisher {
   private static final Logger LOG = LoggerFactory.getLogger(PubSubFlushablePublisher.class);
   private static final long DEFAULT_CLOSE_TIMEOUT_SECONDS = 30;
@@ -138,8 +134,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
               }
             },
             workerName);
-    // SDK shutdown may ignore interrupts. On timeout, also abort the transport and executor
-    // owned by this writer, so pending publish RPCs fail and release the SDK's shutdown waiter.
+    // Publisher.shutdown() ignores interrupts, so close waits on a worker with a deadline.
     worker.setDaemon(true);
     worker.start();
     try {
@@ -177,7 +172,6 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     } catch (IOException failed) {
       failure = failed;
     } catch (InterruptedException interrupted) {
-      // The worker is interrupted when the caller gives up; still run shutdown below.
       Thread.currentThread().interrupt();
       failure = new IOException("Interrupted while flushing Pub/Sub publisher", interrupted);
     } catch (RuntimeException failed) {
@@ -194,13 +188,11 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     }
   }
 
-  /** Shuts down the publisher, then always the callback executor. */
   private void shutdownAll(long closeStarted) throws IOException {
     try {
       shutdownPublisher(closeStarted);
     } finally {
-      // Cancellation callbacks must stay runnable until shutdown's pending-publish waiter
-      // finishes. This executor is separate from the retry scheduler aborted by the caller.
+      // Callbacks must outlive the publisher's shutdown wait, so this executor closes last.
       if (callbackExecutor != null) callbackExecutor.shutdownNow();
     }
   }
@@ -215,8 +207,6 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   private void shutdownPublisher(long closeStarted) throws IOException {
     try {
       publisher.shutdown();
-      // Fixed providers leave these resources to the writer. Any failure below is also followed
-      // by forced cleanup in close(), preserving the original SDK or publish failure.
       if (transport != null) transport.shutdown();
       if (executor != null) executor.shutdown();
       if (callbackExecutor != null) callbackExecutor.shutdown();
@@ -252,7 +242,6 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     // Never cancel the future: the worker must still run its shutdown finally block.
     worker.interrupt();
     forceResources(failure);
-    // Runs once, immediately if the worker already finished, otherwise when it does.
     cleanup.whenComplete(
         (ignored, error) -> {
           if (error == null) {
@@ -270,8 +259,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   }
 
   private void forceResources(Throwable failure) {
-    // Callback execution must survive until the SDK shutdown waiter drains. Construction failure,
-    // in contrast, can close both executors immediately because no publishes were handed off.
+    // The callback executor is left to the worker; see shutdownAll.
     forceCloseResources(failure, transport, executor);
   }
 
@@ -287,10 +275,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     if (fatal != null) throw fatal;
   }
 
-  /**
-   * Runs one cleanup step without stopping the rest. Exceptions are recorded on {@code failure};
-   * the first {@link Error} is returned so the caller can rethrow it once every step has run.
-   */
+  /** Runs one cleanup step; records exceptions on {@code failure} and returns the first Error. */
   private static Error shutdownNow(Throwable failure, Error fatal, Runnable cleanup) {
     try {
       cleanup.run();
@@ -307,7 +292,6 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException;
   }
 
-  /** Waits for one resource within the remaining close budget. */
   private void awaitTermination(String name, Terminable resource, long closeStarted)
       throws IOException, InterruptedException {
     if (!resource.awaitTermination(remainingNanos(closeStarted), TimeUnit.NANOSECONDS)) {
