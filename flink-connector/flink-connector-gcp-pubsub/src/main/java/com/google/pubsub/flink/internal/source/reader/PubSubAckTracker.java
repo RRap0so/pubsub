@@ -72,7 +72,7 @@ public class PubSubAckTracker implements AckTracker {
   private final List<String> stagedAcks = new ArrayList<>();
 
   @GuardedBy("this")
-  private final SortedMap<Long, List<String>> checkpoints = new TreeMap<>();
+  private final SortedMap<Long, Deque<String>> checkpoints = new TreeMap<>();
 
   @Override
   public synchronized boolean addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer) {
@@ -97,7 +97,7 @@ public class PubSubAckTracker implements AckTracker {
 
   @Override
   public synchronized void addCheckpoint(long checkpointId) {
-    checkpoints.put(checkpointId, new ArrayList<>(stagedAcks));
+    checkpoints.put(checkpointId, new ArrayDeque<>(stagedAcks));
     stagedAcks.clear();
   }
 
@@ -105,21 +105,16 @@ public class PubSubAckTracker implements AckTracker {
   public synchronized void notifyCheckpointComplete(long checkpointId) {
     while (!checkpoints.isEmpty() && checkpoints.firstKey() <= checkpointId) {
       long completed = checkpoints.firstKey();
-      List<String> messages = checkpoints.get(completed);
-      int acknowledged = 0;
+      Deque<String> batch = checkpoints.get(completed);
       try {
-        for (String messageId : messages) {
-          Delivery delivery = outstandingAcks.get(messageId);
-          // Remove each handle only after its ack succeeds, so a retry never acks it twice.
-          delivery.resolve(true);
+        // Remove each message only after its ack succeeds, so a retry never acks it twice.
+        for (String messageId; (messageId = batch.peek()) != null; batch.poll()) {
+          outstandingAcks.get(messageId).resolve(true);
           outstandingAcks.remove(messageId);
-          acknowledged++;
         }
       } catch (RuntimeException | Error failure) {
         checkpointAckFailures.inc();
         throw failure;
-      } finally {
-        messages.subList(0, acknowledged).clear();
       }
       checkpoints.remove(completed);
     }
