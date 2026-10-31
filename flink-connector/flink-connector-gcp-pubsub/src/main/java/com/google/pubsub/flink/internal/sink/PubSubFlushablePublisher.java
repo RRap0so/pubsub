@@ -205,7 +205,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
       try {
         shutdownPublisher(closeStarted);
       } catch (IOException shutdownFailure) {
-        failure = withSuppressed(failure, shutdownFailure);
+        failure = firstFailure(failure, shutdownFailure);
       }
     }
     if (failure != null) {
@@ -213,11 +213,14 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     }
   }
 
-  /** Returns the first failure, with any later one attached as suppressed. */
-  private static IOException withSuppressed(IOException primary, IOException later) {
-    if (primary == null) return later;
-    primary.addSuppressed(later);
-    return primary;
+  /**
+   * Returns {@code first}, or {@code next} if nothing failed earlier; a later failure is attached
+   * to it.
+   */
+  private static IOException firstFailure(IOException first, IOException next) {
+    if (first == null) return next;
+    first.addSuppressed(next);
+    return first;
   }
 
   private void shutdownPublisher(long closeStarted) throws IOException {
@@ -270,7 +273,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     forceCloseResources(failure, transport, executor);
   }
 
-  /** Aborts the supplied owned resources, preserving the primary failure and all cleanup errors. */
+  /** Force-closes the given resources; any cleanup errors are attached to {@code failure}. */
   @Internal
   public static void forceCloseResources(
       Throwable failure, TransportChannel transport, ExecutorService... executors) {
