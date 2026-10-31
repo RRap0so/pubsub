@@ -36,7 +36,9 @@ import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.Executors;
@@ -60,6 +62,45 @@ public class PubSubPublisherShutdownIT {
   @Test(timeout = 30000)
   public void repeatedClosesDuringRetryBackoff_doNotStrandShutdownWaiters() throws Exception {
     verifyStalledCloses(false, true);
+  }
+
+  @Test(timeout = 60000)
+  public void stalledCloses_leaveNoThreadsBehind() throws Exception {
+    Set<Thread> before = new HashSet<>(Thread.getAllStackTraces().keySet());
+    verifyStalledCloses(false, false);
+    verifyStalledCloses(true, false);
+    verifyStalledCloses(false, true);
+    List<Thread> leaked = new ArrayList<>();
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    do {
+      leaked.clear();
+      for (Thread thread : Thread.getAllStackTraces().keySet()) {
+        if (thread.isAlive() && !before.contains(thread) && !isIgnorable(thread)) {
+          leaked.add(thread);
+        }
+      }
+      if (!leaked.isEmpty()) Thread.sleep(100);
+    } while (!leaked.isEmpty() && System.nanoTime() < deadline);
+    StringBuilder report = new StringBuilder();
+    for (Thread thread : leaked) {
+      report.append("\n").append(thread.getName()).append(" (daemon=").append(thread.isDaemon());
+      report.append(")");
+      StackTraceElement[] stack = thread.getStackTrace();
+      for (int i = 0; i < Math.min(stack.length, 8); i++)
+        report.append("\n    at ").append(stack[i]);
+    }
+    assertThat(report.toString()).isEmpty();
+  }
+
+  private static boolean isIgnorable(Thread thread) {
+    String name = thread.getName();
+    return name.equals("Reference Handler")
+        || name.equals("Finalizer")
+        || name.equals("Signal Dispatcher")
+        || name.equals("Attach Listener")
+        || name.startsWith("Common-Cleaner")
+        || name.startsWith("process reaper")
+        || name.startsWith("ForkJoinPool.commonPool-worker");
   }
 
   private void verifyStalledCloses(boolean ordered, boolean retryBackoff) throws Exception {
@@ -138,7 +179,9 @@ public class PubSubPublisherShutdownIT {
           // This batch waits behind the first one inside the SDK's per-key executor.
           publisher.publish(message);
         }
+        long closeStart = System.nanoTime();
         assertThrows(IOException.class, publisher::close);
+        assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeStart)).isLessThan(1000L);
         publisher.close();
         for (Thread thread : Thread.getAllStackTraces().keySet()) {
           if (thread.getName().startsWith("pubsub-publisher-close")) workers.add(thread);
