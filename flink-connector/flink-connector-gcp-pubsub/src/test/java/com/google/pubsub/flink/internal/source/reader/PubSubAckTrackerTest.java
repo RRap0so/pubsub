@@ -24,7 +24,15 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import com.google.cloud.pubsub.v1.AckReplyConsumer;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.Gauge;
+import org.apache.flink.metrics.SimpleCounter;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -419,5 +427,122 @@ public class PubSubAckTrackerTest {
     verify(mockAck1).nack();
     verify(mockAck2).nack();
     verify(mockAck3).nack();
+  }
+
+  private final RecordingGroup group = new RecordingGroup();
+  private final AtomicLong clock = new AtomicLong();
+
+  @Test
+  public void ownershipGauges_followEmissionCheckpointRedeliveryAndShutdown() {
+    PubSubAckTracker tracker = new PubSubAckTracker(group, clock::get);
+    tracker.addPendingAck("A", mock(AckReplyConsumer.class));
+    clock.set(TimeUnit.MILLISECONDS.toNanos(100));
+    tracker.addPendingAck("B", mock(AckReplyConsumer.class));
+    assertThat(group.value("outstandingMessages")).isEqualTo(2);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(2);
+    assertThat(group.value("pendingMessages")).isEqualTo(2);
+    tracker.stagePendingAck("A");
+    assertThat(group.value("pendingMessages")).isEqualTo(1);
+    assertThat(group.value("stagedMessages")).isEqualTo(1);
+    tracker.addCheckpoint(1);
+    assertThat(group.value("stagedMessages")).isEqualTo(0);
+    assertThat(group.value("checkpointAckBatches")).isEqualTo(1);
+    clock.set(TimeUnit.MILLISECONDS.toNanos(250));
+    tracker.addPendingAck("A", mock(AckReplyConsumer.class));
+    assertThat(group.count("redeliveries")).isEqualTo(1);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(3);
+    assertThat(group.value("oldestOutstandingAgeMillis")).isEqualTo(250L);
+    tracker.notifyCheckpointComplete(1);
+    assertThat(group.value("outstandingMessages")).isEqualTo(1);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(1);
+    assertThat(group.value("oldestOutstandingAgeMillis")).isEqualTo(150L);
+    tracker.nackAll();
+    assertThat(group.value("outstandingMessages")).isEqualTo(0);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(0);
+    assertThat(group.value("pendingMessages")).isEqualTo(0);
+    assertThat(group.value("checkpointAckBatches")).isEqualTo(0);
+    assertThat(group.value("oldestOutstandingAgeMillis")).isEqualTo(0L);
+  }
+
+  @Test
+  public void failedCheckpointAck_keepsOwnershipGaugesAndFailureCounterAccurate() {
+    PubSubAckTracker tracker = new PubSubAckTracker(group, clock::get);
+    AckReplyConsumer consumer = mock(AckReplyConsumer.class);
+    org.mockito.Mockito.doThrow(new IllegalStateException("Callback failure")).when(consumer).ack();
+    tracker.addPendingAck("A", consumer);
+    tracker.stagePendingAck("A");
+    tracker.addCheckpoint(1);
+    assertThrows(IllegalStateException.class, () -> tracker.notifyCheckpointComplete(1));
+    assertThat(group.count("checkpointAckFailures")).isEqualTo(1);
+    assertThat(group.value("outstandingMessages")).isEqualTo(1);
+    assertThat(group.value("checkpointAckBatches")).isEqualTo(1);
+    tracker.nackAll();
+    assertThat(group.value("outstandingMessages")).isEqualTo(0);
+  }
+
+  @Test
+  public void deliveryHandleGauge_deduplicatesIdentityAndRemovesSuccessfulAckPrefix() {
+    PubSubAckTracker tracker = new PubSubAckTracker(group, clock::get);
+    AckReplyConsumer original = mock(AckReplyConsumer.class);
+    AckReplyConsumer latest = mock(AckReplyConsumer.class);
+    org.mockito.Mockito.doThrow(new IllegalStateException("Callback failure")).when(original).ack();
+    tracker.addPendingAck("A", original);
+    tracker.addPendingAck("A", latest);
+    tracker.addPendingAck("A", original);
+    tracker.addPendingAck("A", latest);
+    assertThat(group.value("outstandingMessages")).isEqualTo(1);
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(2);
+    tracker.stagePendingAck("A");
+    tracker.addCheckpoint(1);
+    assertThrows(IllegalStateException.class, () -> tracker.notifyCheckpointComplete(1));
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(1);
+    tracker.nackAll();
+    assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(0);
+  }
+
+  private static final class RecordingGroup extends UnregisteredMetricsGroup {
+    private final Map<String, Counter> counters;
+    private final Map<String, Gauge<?>> gauges;
+    private final String prefix;
+
+    RecordingGroup() {
+      this("", new HashMap<>(), new HashMap<>());
+    }
+
+    RecordingGroup(String prefix, Map<String, Counter> counters, Map<String, Gauge<?>> gauges) {
+      this.prefix = prefix;
+      this.counters = counters;
+      this.gauges = gauges;
+    }
+
+    @Override
+    public Counter counter(String name) {
+      return counters.computeIfAbsent(prefix + name, unused -> new SimpleCounter());
+    }
+
+    @Override
+    public <C extends Counter> C counter(String name, C counter) {
+      counters.put(prefix + name, counter);
+      return counter;
+    }
+
+    @Override
+    public <T, G extends Gauge<T>> G gauge(String name, G gauge) {
+      gauges.put(prefix + name, gauge);
+      return gauge;
+    }
+
+    @Override
+    public RecordingGroup addGroup(String name) {
+      return new RecordingGroup(prefix + name + ".", counters, gauges);
+    }
+
+    long count(String name) {
+      return counters.get(name).getCount();
+    }
+
+    Object value(String name) {
+      return gauges.get(name).getValue();
+    }
   }
 }

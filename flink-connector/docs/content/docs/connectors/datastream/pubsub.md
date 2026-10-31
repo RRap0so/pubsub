@@ -211,10 +211,6 @@ Each source reader reports these metrics in its `pubsub` metric group:
 | `redeliveries` | Duplicate deliveries that were not emitted. |
 | `checkpointAckFailures` | Checkpoints whose acknowledgements failed. |
 
-The `pubsub.ack` and `pubsub.nack` groups count acknowledgement requests and their
-results. Results are only confirmed by Pub/Sub on subscriptions with exactly-once
-delivery enabled.
-
 ### All Options
 
 #### Required Builder Options
