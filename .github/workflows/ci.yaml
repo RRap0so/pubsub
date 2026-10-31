@@ -95,10 +95,3 @@ jobs:
       - name: Build and test
         working-directory: flink-connector
         run: mvn -B clean verify
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: flink-connector-test-results
-          path: |
-            flink-connector/flink-connector-gcp-pubsub/target/surefire-reports/
-            flink-connector/flink-connector-gcp-pubsub/target/failsafe-reports/
