@@ -17,10 +17,12 @@ package com.google.pubsub.flink.internal.source.enumerator;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.pubsub.flink.internal.source.reader.PubSubReplayReadyEvent;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
 import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import com.google.pubsub.v1.ProjectSubscriptionName;
@@ -73,6 +75,18 @@ public class PubSubSplitEnumeratorTest {
       }
       return true;
     }
+  }
+
+  @Test
+  public void restoredReader_receivesReplayReadinessEvenWhenItAlreadyHasAnAssignment() {
+    var assignments = new HashMap<Integer, SubscriptionSplit>();
+    assignments.put(0, SubscriptionSplit.create(SUBSCRIPTION_NAME, "0"));
+    when(mockContext.registeredReaders()).thenReturn(createRegisteredReaders(List.of(0)));
+    var restored =
+        new PubSubSplitEnumerator(
+            SUBSCRIPTION_NAME, mockContext, assignments, mock(PubSubReplaySnapshots.class));
+    restored.addReader(0);
+    verify(mockContext).sendEventToSourceReader(0, PubSubReplayReadyEvent.INSTANCE);
   }
 
   @Before

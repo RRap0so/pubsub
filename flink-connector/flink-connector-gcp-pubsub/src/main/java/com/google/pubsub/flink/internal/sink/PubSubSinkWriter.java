@@ -40,6 +40,6 @@ public class PubSubSinkWriter<T> implements SinkWriter<T> {
 
   @Override
   public void close() throws IOException {
-    publisher.flush();
+    publisher.close();
   }
 }

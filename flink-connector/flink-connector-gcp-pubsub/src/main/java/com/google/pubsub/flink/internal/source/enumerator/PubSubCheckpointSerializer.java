@@ -23,7 +23,7 @@ public class PubSubCheckpointSerializer
     implements SimpleVersionedSerializer<PubSubEnumeratorCheckpoint> {
   @Override
   public int getVersion() {
-    return 0;
+    return 3;
   }
 
   @Override
@@ -32,7 +32,10 @@ public class PubSubCheckpointSerializer
   }
 
   @Override
-  public PubSubEnumeratorCheckpoint deserialize(int i, byte[] bytes) throws IOException {
+  public PubSubEnumeratorCheckpoint deserialize(int version, byte[] bytes) throws IOException {
+    if (version < 0 || version > getVersion()) {
+      throw new IOException("Unsupported Pub/Sub enumerator checkpoint version: " + version);
+    }
     return PubSubEnumeratorCheckpoint.parseFrom(bytes);
   }
 }

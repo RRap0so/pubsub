@@ -18,21 +18,24 @@ package com.google.pubsub.flink;
 import com.google.api.gax.batching.FlowControlSettings;
 import com.google.api.gax.core.FixedCredentialsProvider;
 import com.google.api.gax.core.NoCredentialsProvider;
-import com.google.api.gax.grpc.GrpcTransportChannel;
+import com.google.api.gax.grpc.InstantiatingGrpcChannelProvider;
 import com.google.api.gax.rpc.FixedHeaderProvider;
-import com.google.api.gax.rpc.FixedTransportChannelProvider;
 import com.google.auth.Credentials;
 import com.google.auto.value.AutoValue;
 import com.google.cloud.pubsub.v1.MessageReceiver;
+import com.google.cloud.pubsub.v1.MessageReceiverWithAckResponse;
 import com.google.cloud.pubsub.v1.Subscriber;
 import com.google.cloud.pubsub.v1.SubscriptionAdminSettings;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.pubsub.flink.internal.source.enumerator.PubSubCheckpointSerializer;
+import com.google.pubsub.flink.internal.source.enumerator.PubSubReplaySnapshots;
+import com.google.pubsub.flink.internal.source.enumerator.PubSubSnapshotStore;
 import com.google.pubsub.flink.internal.source.enumerator.PubSubSplitEnumerator;
 import com.google.pubsub.flink.internal.source.reader.AckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubAckTracker;
 import com.google.pubsub.flink.internal.source.reader.PubSubNotifyingPullSubscriber;
+import com.google.pubsub.flink.internal.source.reader.PubSubReaderMetrics;
 import com.google.pubsub.flink.internal.source.reader.PubSubSourceReader;
 import com.google.pubsub.flink.internal.source.reader.PubSubSplitReader;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
@@ -41,8 +44,10 @@ import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import com.google.pubsub.flink.util.EmulatorEndpoint;
 import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.PubsubMessage;
-import io.grpc.ManagedChannelBuilder;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.HashMap;
+import java.util.UUID;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.connector.source.Boundedness;
@@ -55,6 +60,7 @@ import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.util.UserCodeClassLoader;
 import org.threeten.bp.Duration;
 
@@ -85,24 +91,29 @@ public abstract class PubSubSource<OutputT>
 
   public abstract Optional<String> endpoint();
 
+  public abstract Optional<Integer> replaySnapshotRetentionCount();
+
+  abstract String replaySnapshotNamespace();
+
+  abstract boolean replayDeduplicationRequired();
+
   public static <OutputT> Builder<OutputT> builder() {
-    return new AutoValue_PubSubSource.Builder<OutputT>();
+    return new AutoValue_PubSubSource.Builder<OutputT>()
+        .setReplaySnapshotNamespace(UUID.randomUUID().toString().replace("-", ""))
+        .setReplayDeduplicationRequired(false);
   }
 
   Subscriber createSubscriber(MessageReceiver receiver) {
+    return createSubscriber(receiver, new PubSubReaderMetrics(new UnregisteredMetricsGroup()));
+  }
+
+  Subscriber createSubscriber(MessageReceiver receiver, PubSubReaderMetrics metrics) {
+    MessageReceiverWithAckResponse observedReceiver =
+        (message, consumer) -> receiver.receiveMessage(message, metrics.observe(consumer));
     Subscriber.Builder builder =
         Subscriber.newBuilder(
-            ProjectSubscriptionName.of(projectName(), subscriptionName()).toString(), receiver);
-    // Channel settings copied from com.google.cloud:google-cloud-pubsub:1.124.1.
-    builder.setChannelProvider(
-        SubscriptionAdminSettings.defaultGrpcTransportProviderBuilder()
-            .setMaxInboundMessageSize(20 * 1024 * 1024) // 20MB API maximum message size.
-            .setMaxInboundMetadataSize(4 * 1024 * 1024) // 4MB API maximum metadata size)
-            .setKeepAliveTime(Duration.ofMinutes(5))
-            .setHeaderProvider(
-                FixedHeaderProvider.create(
-                    "x-goog-api-client", "PubSub-Flink-Connector/1.0.1-SNAPSHOT"))
-            .build());
+            ProjectSubscriptionName.of(projectName(), subscriptionName()).toString(),
+            observedReceiver);
     builder.setFlowControlSettings(
         FlowControlSettings.newBuilder()
             .setMaxOutstandingElementCount(maxOutstandingMessagesCount().or(1000L))
@@ -122,17 +133,35 @@ public abstract class PubSubSource<OutputT>
     String emulatorEndpoint = EmulatorEndpoint.getEmulatorEndpoint(endpoint());
     if (emulatorEndpoint != null) {
       builder.setCredentialsProvider(NoCredentialsProvider.create());
-      builder.setChannelProvider(
-          FixedTransportChannelProvider.create(
-              GrpcTransportChannel.create(
-                  ManagedChannelBuilder.forTarget(emulatorEndpoint).usePlaintext().build())));
+      builder.setEndpoint(emulatorEndpoint);
     }
+    builder.setChannelProvider(createChannelProvider(emulatorEndpoint));
     return builder.build();
   }
 
-  private PubSubSplitReader createSplitReader(AckTracker ackTracker) {
+  InstantiatingGrpcChannelProvider createChannelProvider(String emulatorEndpoint) {
+    // Let the SDK create and own channels so stop/failure also closes emulator transports.
+    InstantiatingGrpcChannelProvider.Builder provider =
+        SubscriptionAdminSettings.defaultGrpcTransportProviderBuilder()
+            .setMaxInboundMessageSize(20 * 1024 * 1024)
+            .setMaxInboundMetadataSize(4 * 1024 * 1024)
+            .setKeepAliveTime(Duration.ofMinutes(5))
+            .setHeaderProvider(
+                FixedHeaderProvider.create(
+                    "x-goog-api-client", "PubSub-Flink-Connector/1.0.1-SNAPSHOT"));
+    if (emulatorEndpoint != null) {
+      provider
+          .setEndpoint(emulatorEndpoint)
+          .setChannelConfigurator(channel -> channel.usePlaintext());
+    }
+    return provider.build();
+  }
+
+  private PubSubSplitReader createSplitReader(AckTracker ackTracker, PubSubReaderMetrics metrics) {
     return new PubSubSplitReader(
-        () -> new PubSubNotifyingPullSubscriber(this::createSubscriber, ackTracker));
+        () ->
+            new PubSubNotifyingPullSubscriber(
+                receiver -> createSubscriber(receiver, metrics), ackTracker));
   }
 
   @Override
@@ -156,12 +185,15 @@ public abstract class PubSubSource<OutputT>
             return null;
           }
         });
+    MetricGroup metrics = readerContext.metricGroup().addGroup("pubsub");
+    PubSubReaderMetrics acknowledgementMetrics = new PubSubReaderMetrics(metrics);
     return new PubSubSourceReader<>(
         schema,
-        new PubSubAckTracker(),
-        this::createSplitReader,
+        new PubSubAckTracker(metrics),
+        ackTracker -> createSplitReader(ackTracker, acknowledgementMetrics),
         new Configuration(),
-        readerContext);
+        readerContext,
+        replaySnapshotRetentionCount().isPresent());
   }
 
   @Override
@@ -170,19 +202,63 @@ public abstract class PubSubSource<OutputT>
     return new PubSubSplitEnumerator(
         ProjectSubscriptionName.of(projectName(), subscriptionName()),
         enumContext,
-        new HashMap<Integer, SubscriptionSplit>());
+        new HashMap<Integer, SubscriptionSplit>(),
+        createReplaySnapshots(null),
+        replayDeduplicationRequired());
   }
 
   @Override
   public SplitEnumerator<SubscriptionSplit, PubSubEnumeratorCheckpoint> restoreEnumerator(
       SplitEnumeratorContext<SubscriptionSplit> enumContext,
       PubSubEnumeratorCheckpoint checkpoint) {
+    Preconditions.checkState(
+        checkpoint.getReplayDeduplicationRequired() == replayDeduplicationRequired(),
+        "Replay deduplication cannot be enabled or disabled when restoring an existing checkpoint");
+    Preconditions.checkState(
+        replaySnapshotRetentionCount().isPresent()
+            || checkpoint.getReplaySnapshotNamespace().isEmpty(),
+        "Enable replay snapshot recovery to restore this checkpoint");
+    Preconditions.checkState(
+        !replaySnapshotRetentionCount().isPresent()
+            || !checkpoint.getReplaySnapshotNamespace().isEmpty(),
+        "This checkpoint has no replay snapshot; acknowledged input cannot be recovered safely");
+    Preconditions.checkArgument(
+        checkpoint.getReplaySnapshotNamespace().isEmpty()
+            || checkpoint
+                .getReplaySubscription()
+                .equals(ProjectSubscriptionName.of(projectName(), subscriptionName()).toString()),
+        "Replay checkpoint belongs to a different subscription");
     HashMap<Integer, SubscriptionSplit> assignments = new HashMap<>();
     for (PubSubEnumeratorCheckpoint.Assignment assignment : checkpoint.getAssignmentsList()) {
       assignments.put(assignment.getSubtask(), SubscriptionSplit.fromProto(assignment.getSplit()));
     }
     return new PubSubSplitEnumerator(
-        ProjectSubscriptionName.of(projectName(), subscriptionName()), enumContext, assignments);
+        ProjectSubscriptionName.of(projectName(), subscriptionName()),
+        enumContext,
+        assignments,
+        createReplaySnapshots(checkpoint),
+        replayDeduplicationRequired());
+  }
+
+  private PubSubReplaySnapshots createReplaySnapshots(PubSubEnumeratorCheckpoint checkpoint) {
+    if (!replaySnapshotRetentionCount().isPresent()) {
+      return null;
+    }
+    PubSubSnapshotStore store;
+    try {
+      store = new PubSubSnapshotStore(projectName(), subscriptionName(), credentials(), endpoint());
+    } catch (IOException failure) {
+      throw new UncheckedIOException("Unable to open the replay snapshot client", failure);
+    }
+    try {
+      return checkpoint == null
+          ? PubSubReplaySnapshots.startFresh(
+              store, replaySnapshotRetentionCount().get(), replaySnapshotNamespace())
+          : PubSubReplaySnapshots.restore(store, replaySnapshotRetentionCount().get(), checkpoint);
+    } catch (RuntimeException failure) {
+      store.close();
+      throw failure;
+    }
   }
 
   @Override
@@ -271,6 +347,26 @@ public abstract class PubSubSource<OutputT>
      */
     public abstract Builder<OutputT> setEndpoint(String endpoint);
 
+    /**
+     * Enables checkpoint-coordinated Pub/Sub snapshots and retains the last {@code count} snapshot
+     * provider boundaries at or before the newest completed checkpoint, plus one shared pending
+     * boundary. Checkpoints and savepoints awaiting completion can reuse that earlier boundary;
+     * total provider snapshots stay bounded by {@code count + 1}.
+     *
+     * <p>Disabled by default. Requires a dedicated subscription and snapshot create, delete, list,
+     * and seek permissions. Snapshot storage is billed separately. Older or expired snapshots
+     * cannot be restored; recovery fails rather than silently skipping acknowledged input.
+     *
+     * <p>Replay provides at-least-once input recovery and can duplicate records already in the
+     * restored state. Snapshots remain after job shutdown for recovery and expire under Pub/Sub's
+     * retention policy. Cleanup of abandoned jobs must be managed separately.
+     */
+    public abstract Builder<OutputT> setReplaySnapshotRetentionCount(Integer count);
+
+    abstract Builder<OutputT> setReplaySnapshotNamespace(String namespace);
+
+    abstract Builder<OutputT> setReplayDeduplicationRequired(boolean required);
+
     abstract PubSubSource<OutputT> autoBuild();
 
     public final PubSubSource<OutputT> build() {
@@ -284,6 +380,9 @@ public abstract class PubSubSource<OutputT>
       Preconditions.checkArgument(
           source.parallelPullCount().or(1) > 0,
           "parallelPullCount, if set, must be a value greater than 0.");
+      Preconditions.checkArgument(
+          source.replaySnapshotRetentionCount().or(1) > 0,
+          "replaySnapshotRetentionCount, if set, must be a value greater than 0.");
       return source;
     }
   }

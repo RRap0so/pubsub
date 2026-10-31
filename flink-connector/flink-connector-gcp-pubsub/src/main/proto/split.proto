@@ -33,4 +33,18 @@ message PubSubEnumeratorCheckpoint {
     SubscriptionSplitProto split = 2;
   }
   repeated Assignment assignments = 1;
+  // Empty for checkpoints made without replay snapshot recovery.
+  string replay_snapshot_namespace = 2;
+  // Creation checkpoint ID of the selected provider snapshot; it may precede this Flink checkpoint.
+  int64 replay_checkpoint_id = 3;
+  message ReplaySnapshot {
+    int64 checkpoint_id = 1;
+    string name = 2;
+  }
+  repeated ReplaySnapshot replay_snapshots = 4;
+  string replay_subscription = 5;
+  // Prevent restoring without the checkpointed message-ID index, or adding an empty index.
+  bool replay_deduplication_required = 6;
+  // Known unneeded resources only; unknown snapshots may belong to newer savepoints.
+  repeated string pending_snapshot_deletions = 7;
 }

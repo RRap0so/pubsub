@@ -13,7 +13,7 @@ Prerequisites:
 *   Unix-like environment (we use Linux, Mac OS X)
 *   Git
 *   Maven (we recommend version 3.8.6)
-*   Java 11
+*   Java 17
 
 ```sh
 git clone https://github.com/GoogleCloudPlatform/pubsub.git
@@ -130,8 +130,93 @@ Checkpointing is required to use Pub/Sub source. When a checkpoint completes,
 all messages delivered before the last successful checkpoint are acknowledged to
 Google Cloud Pub/Sub. In case of failure, messages delivered after the last
 successful checkpoint are unacknowledged and will automatically be redelivered.
-Note that there is no message delivery state stored in checkpoints, so retained
-checkpoints are not necessary to resume using Pub/Sub source.
+By default, source checkpoints contain subscription assignments, not a rewindable
+input position. Restoring an older checkpoint does not rewind acknowledgements
+made by newer checkpoints, so input missing from the restored state can be lost.
+
+For at-least-once replay from retained checkpoints and savepoints, explicitly set
+`PubSubSource.<OutputT>builder().setReplaySnapshotRetentionCount(count)` with a
+positive count. The coordinator captures a Pub/Sub snapshot before the readers'
+checkpoint barriers and stores its reference in checkpoint state. Restore seeks
+to that snapshot before a coordinator readiness event permits restored readers to start pulling. Missing or expired snapshots fail
+recovery rather than silently skipping input.
+
+This option is disabled by default and requires a dedicated subscription and
+snapshot create, get, list, delete, and seek permissions. Checkpoints written by this
+version use a newer enumerator state format, so older connector versions cannot restore
+them; downgrading the connector requires starting from fresh source state. It retains the last
+`count` completed provider boundaries plus one shared pending boundary. Savepoints
+without completion notifications can share an earlier boundary.
+
+Restore preserves unreferenced snapshots because they may belong to newer completed
+savepoints. Those resources remain until provider expiry.
+They and pending deletions count toward the namespace's `count + 1` resource budget.
+If that budget is full, a checkpoint reuses a valid known boundary rather than creating
+another resource. Restarts therefore cannot evade the resource budget. The coordinator
+lists the namespace once on startup or restore, then tracks its own creates and deletes
+locally; checkpoint allocation does not repeat a project-wide list. External removals,
+including provider expiry of unknown snapshots, require restarting the coordinator
+to refresh that inventory.
+
+After restoring an older checkpoint with a full budget, successive checkpoints may keep
+selecting its older provider boundary. This increases replay and lets that boundary age.
+A healthy running job can create a fresh boundary when expiry and successful deletion
+free a slot, but recovery from a checkpoint referencing an expired boundary fails.
+
+Failed deletes are queued, logged, and retried without failing checkpoint completion.
+The queue is included in subsequent checkpoint state and retried after a successful
+restore seek. This covers cleanup recorded in a completed checkpoint. A remote create
+followed by a crash before its cleanup intent reaches a completed checkpoint can still
+leave an unknown snapshot. Restore preserves it because it cannot distinguish it from
+a valid newer savepoint. It counts toward the budget until a restart refreshes the
+inventory after provider expiry.
+If creating a new snapshot fails, an existing unexpired boundary can be reused to
+allow checkpoint ACKs and backlog drainage. Recovery may consequently replay more
+input. A missing or expired boundary is never used as a fallback. If no safe boundary
+exists (including the first checkpoint of an old backlog), checkpointing fails rather
+than claiming replay protection that was never established.
+
+Older checkpoints outside the retained window cannot be restored. Pub/Sub bills retained
+snapshot data separately. Replay is at least once and may duplicate records represented
+in Flink state; the opt-in helper below suppresses provider-message-ID duplicates.
+
+### Checkpointed replay deduplication
+
+`PubSubReplayDeduplication.read` adds a keyed, checkpointed message-ID index before
+user deserialization. For example:
+
+```java
+env.enableCheckpointing(10_000);
+env.setMaxParallelism(128); // Keep this value stable across restores and rescaling.
+PubSubSource<String> source = PubSubSource.<String>builder()
+    .setProjectName("my-project")
+    .setSubscriptionName("my-subscription")
+    .setDeserializationSchema(PubSubDeserializationSchema.dataOnly(new SimpleStringSchema()))
+    .setReplaySnapshotRetentionCount(4)
+    .build();
+DataStream<String> input = PubSubReplayDeduplication.read(
+    env, source, WatermarkStrategy.noWatermarks(), "stable-pubsub-uid", Duration.ofDays(8));
+```
+
+Replay snapshots and exactly-once checkpoint consistency are required. Keep the UID
+prefix, operator topology, and maximum parallelism stable. Existing checkpoints without
+this stage cannot be migrated: they do not contain the message-ID index. Enabling or
+disabling deduplication when restoring existing state is rejected.
+
+Retention must be at least eight days and cover every message a retained snapshot
+might replay. TTL uses processing time since first acceptance, including downtime;
+duplicates do not extend it. Expired IDs can be emitted again. State grows with the
+number of distinct provider IDs during that period, so size the state backend and
+checkpoint storage accordingly. Separate publications of the same payload have
+different IDs. External writes still require transactions or downstream idempotency.
+
+**Ordering and event time:** this helper shuffles by provider message ID. With parallelism
+above one, messages sharing a Pub/Sub ordering key can reach different subtasks, so
+it does not preserve ordering-key order. The supplied watermark strategy runs after
+that shuffle and deserialization, rather than on the source. Its idleness therefore
+applies to the downstream watermark operator; source-split idleness and source watermark
+alignment are not provided by this helper. Pipelines requiring these semantics need a
+different topology and should not assume the helper preserves them.
 
 ### StreamingPull Connections and Flow Control
 
@@ -259,10 +344,28 @@ redelivered by Google Cloud Pub/Sub.
         <td>pubsub.googleapis.com:443</td>
         <td>The Google Cloud Pub/Sub gRPC endpoint from which messages are pulled. Defaults to the global endpoint, which routes requests to the nearest regional endpoint.</td>
     </tr>
+    <tr>
+        <td>setReplaySnapshotRetentionCount(Integer count)</td>
+        <td>(disabled)</td>
+        <td>Enables checkpoint-coordinated replay snapshots. Retains the most recent count completed provider boundaries plus one shared pending boundary, bounded by count + 1 provider snapshots. Requires count &gt; 0, snapshot permissions, and a dedicated subscription. Snapshot storage is billed separately; replay remains at least once.</td>
+    </tr>
   </tbody>
 </table>
 
 ## Pub/Sub Sink
+
+Each sink writer owns a publisher and two bounded pools: two publishing/retry threads
+and two transport callback threads. Pools are not shared across writers.
+
+Closing a sink writer waits at most 30 seconds for flushing pending publishes and
+shutting down the publisher. A timeout or task-thread interruption is reported as
+an error; pending publishes are not reported as successful. The writer owns its
+transport, retry scheduler, and callback executor. On timeout or interruption it
+aborts the transport and retry scheduler; callbacks remain runnable until pending
+publishes finish failing, then the cleanup worker closes their executor. Normal
+publish retries are unchanged. Normal checkpoint flushes still wait for publish
+results and report publish failures. Cleanup workers have unique names; if the
+caller stops waiting, logs report the abort and eventual cleanup result.
 
 Pub/Sub sink publishes data to a single Google Cloud Pub/Sub topic with an
 at-least-once guarantee. The sample below shows the minimal configurations
@@ -354,6 +457,55 @@ attributes or ordering keys.
     </tr>
   </tbody>
 </table>
+
+## Source diagnostics
+
+Each source reader registers the following metrics under its `pubsub` metric group:
+
+| Metric | Meaning |
+| --- | --- |
+| `outstandingMessages` | Distinct messages owned by the reader until its ACK callbacks return. |
+| `outstandingDeliveryHandles` | Unresolved delivery handles, including suppressed redeliveries. |
+| `pendingMessages` | Owned messages that have not been emitted downstream. |
+| `stagedMessages` | Emitted messages awaiting inclusion in a checkpoint. |
+| `checkpointAckBatches` | Checkpoint batches awaiting ACK callbacks. |
+| `oldestOutstandingAgeMillis` | Age since first local delivery of the oldest owned message. |
+| `redeliveries` | Repeated deliveries while the reader still owns that message. |
+| `checkpointAckFailures` | Checkpoint-completion attempts interrupted by an ACK callback exception. |
+
+Suppressed redeliveries retain their delivery handles until checkpoint completion
+or shutdown. They are not acknowledged early, and no immediate NACK is sent:
+a stale NACK can trigger another delivery on a standard subscription. These extra
+handles consume SDK flow-control capacity until resolved; compare
+`outstandingDeliveryHandles` with the distinct `outstandingMessages` count.
+
+The `pubsub.ack` and `pubsub.nack` groups separately report `requests`, `inFlight`,
+`oldestInFlightAgeMillis`, `callbackFailures`, and `responseFailures`.
+Their `responses` subgroups count SDK outcomes: `successful`, `invalid`,
+`permission_denied`, `failed_precondition`, and `other`. `responseFailures` also
+includes futures that fail exceptionally or are cancelled. These observations are
+asynchronous and do not block checkpoint completion or change replay ownership.
+
+**SDK success is not always broker confirmation.** When exactly-once delivery is
+disabled on the subscription, the SDK returns immediate success. Server-confirmed
+outcomes require exactly-once delivery on the subscription; this connector does not
+enable it automatically. See the
+[SDK acknowledgement contract](https://cloud.google.com/java/docs/reference/google-cloud-pubsub/latest/com.google.cloud.pubsub.v1.AckReplyConsumerWithResponse).
+
+These gauges describe local reader ownership and SDK operations, not the complete
+Pub/Sub subscription backlog or messages still buffered inside the SDK. Metrics do
+not contain message IDs, acknowledgement IDs, or payloads.
+
+### Replay coordinator diagnostics
+
+The coordinator's `pubsub` group exposes `snapshotCreateFailures`,
+`snapshotDeleteFailures`, `pendingSnapshotDeletions`, and
+`replaySnapshotTimeToExpiryMillis`. The expiry gauge is cached metadata for the
+selected replay boundary; reporters do not issue provider RPCs. Watch it when
+creation is repeatedly falling back to an older snapshot, including after rollback
+with a full resource budget. Alert before the remaining lifetime becomes shorter than
+your expected recovery and operator response time. Expiry remains a hard
+limit on recovery, even when checkpoints continue to ACK input.
 
 ## Integration Testing
 

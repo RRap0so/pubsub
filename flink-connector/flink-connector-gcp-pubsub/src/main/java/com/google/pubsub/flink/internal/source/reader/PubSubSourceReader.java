@@ -15,16 +15,16 @@
  */
 package com.google.pubsub.flink.internal.source.reader;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.pubsub.flink.PubSubDeserializationSchema;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplitState;
 import com.google.pubsub.v1.PubsubMessage;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.base.source.reader.RecordEmitter;
 import org.apache.flink.connector.base.source.reader.SingleThreadMultiplexSourceReaderBase;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitReader;
 
@@ -36,6 +36,8 @@ public class PubSubSourceReader<T>
   }
 
   private final AckTracker ackTracker;
+  private final List<SubscriptionSplit> awaitingReplay = new ArrayList<>();
+  private boolean replayReady;
 
   public PubSubSourceReader(
       PubSubDeserializationSchema<T> schema,
@@ -43,18 +45,50 @@ public class PubSubSourceReader<T>
       SplitReaderFactory splitReaderFactory,
       Configuration config,
       SourceReaderContext context) {
+    this(schema, ackTracker, splitReaderFactory, config, context, false);
+  }
+
+  public PubSubSourceReader(
+      PubSubDeserializationSchema<T> schema,
+      AckTracker ackTracker,
+      SplitReaderFactory splitReaderFactory,
+      Configuration config,
+      SourceReaderContext context,
+      boolean replayRecovery) {
     super(
         () -> splitReaderFactory.create(ackTracker),
         new PubSubRecordEmitter<>(schema, ackTracker),
         config,
         context);
     this.ackTracker = ackTracker;
+    this.replayReady = !replayRecovery;
   }
 
   @Override
   public List<SubscriptionSplit> snapshotState(long checkpointId) {
     ackTracker.addCheckpoint(checkpointId);
-    return super.snapshotState(checkpointId);
+    List<SubscriptionSplit> splits = new ArrayList<>(super.snapshotState(checkpointId));
+    splits.addAll(awaitingReplay);
+    return splits;
+  }
+
+  @Override
+  public void addSplits(List<SubscriptionSplit> splits) {
+    if (replayReady) super.addSplits(splits);
+    else awaitingReplay.addAll(splits);
+  }
+
+  @Override
+  public void handleSourceEvents(SourceEvent event) {
+    if (event == PubSubReplayReadyEvent.INSTANCE) {
+      replayReady = true;
+      if (!awaitingReplay.isEmpty()) {
+        super.addSplits(new ArrayList<>(awaitingReplay));
+        awaitingReplay.clear();
+      }
+    } else {
+      super.handleSourceEvents(event);
+    }
   }
 
   @Override

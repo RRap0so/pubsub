@@ -204,4 +204,56 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+  <profiles>
+    <profile>
+      <id>recovery-it</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>require-recovery-emulator</id>
+                <goals>
+                  <goal>enforce</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <requireEnvironmentVariable>
+                      <variableName>CHECKPOINT_TEST_EMULATOR</variableName>
+                      <regex>127\.0\.0\.1:[0-9]+</regex>
+                      <message>Set CHECKPOINT_TEST_EMULATOR to a running local Pub/Sub emulator (127.0.0.1:port).</message>
+                    </requireEnvironmentVariable>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <version>3.5.4</version>
+            <configuration>
+              <argLine>--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED</argLine>
+              <!-- Exercise this build's classes rather than the dependency-bundled JAR. -->
+              <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+              <failIfNoTests>true</failIfNoTests>
+              <environmentVariables>
+                <PUBSUB_EMULATOR_HOST>${env.CHECKPOINT_TEST_EMULATOR}</PUBSUB_EMULATOR_HOST>
+              </environmentVariables>
+            </configuration>
+            <executions>
+              <execution>
+                <goals>
+                  <goal>integration-test</goal>
+                  <goal>verify</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

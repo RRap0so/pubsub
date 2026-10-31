@@ -15,6 +15,7 @@
  */
 package com.google.pubsub.flink.internal.source.enumerator;
 
+import com.google.pubsub.flink.internal.source.reader.PubSubReplayReadyEvent;
 import com.google.pubsub.flink.internal.source.split.SubscriptionSplit;
 import com.google.pubsub.flink.proto.PubSubEnumeratorCheckpoint;
 import com.google.pubsub.v1.ProjectSubscriptionName;
@@ -37,14 +38,38 @@ public class PubSubSplitEnumerator
   private final ProjectSubscriptionName subscriptionName;
   private final SplitEnumeratorContext<SubscriptionSplit> context;
   private final HashMap<Integer, SubscriptionSplit> readersWithAssignments;
+  @Nullable private final PubSubReplaySnapshots replaySnapshots;
+  private final boolean replayDeduplicationRequired;
 
   public PubSubSplitEnumerator(
       ProjectSubscriptionName subscriptionName,
       SplitEnumeratorContext<SubscriptionSplit> context,
       HashMap<Integer, SubscriptionSplit> readersWithAssignments) {
+    this(subscriptionName, context, readersWithAssignments, null);
+  }
+
+  public PubSubSplitEnumerator(
+      ProjectSubscriptionName subscriptionName,
+      SplitEnumeratorContext<SubscriptionSplit> context,
+      HashMap<Integer, SubscriptionSplit> readersWithAssignments,
+      @Nullable PubSubReplaySnapshots replaySnapshots) {
+    this(subscriptionName, context, readersWithAssignments, replaySnapshots, false);
+  }
+
+  public PubSubSplitEnumerator(
+      ProjectSubscriptionName subscriptionName,
+      SplitEnumeratorContext<SubscriptionSplit> context,
+      HashMap<Integer, SubscriptionSplit> readersWithAssignments,
+      @Nullable PubSubReplaySnapshots replaySnapshots,
+      boolean replayDeduplicationRequired) {
+    this.replayDeduplicationRequired = replayDeduplicationRequired;
     this.subscriptionName = subscriptionName;
     this.context = context;
     this.readersWithAssignments = readersWithAssignments;
+    this.replaySnapshots = replaySnapshots;
+    if (replaySnapshots != null && context.metricGroup() != null) {
+      replaySnapshots.registerMetrics(context.metricGroup().addGroup("pubsub"));
+    }
   }
 
   @Override
@@ -62,6 +87,9 @@ public class PubSubSplitEnumerator
 
   @Override
   public void addReader(int subtaskId) {
+    if (replaySnapshots != null) {
+      context.sendEventToSourceReader(subtaskId, PubSubReplayReadyEvent.INSTANCE);
+    }
     checkForUnassignedReaders();
   }
 
@@ -76,11 +104,39 @@ public class PubSubSplitEnumerator
                   .setSubtask(task)
                   .build());
         });
-    return PubSubEnumeratorCheckpoint.newBuilder().addAllAssignments(assignments).build();
+    PubSubEnumeratorCheckpoint.Builder checkpoint =
+        PubSubEnumeratorCheckpoint.newBuilder()
+            .addAllAssignments(assignments)
+            .setReplayDeduplicationRequired(replayDeduplicationRequired);
+    if (replaySnapshots != null) {
+      checkpoint.setReplaySubscription(subscriptionName.toString());
+      // Flink checkpoints coordinators before triggering task barriers. The selected shared
+      // subscription snapshot must already exist before any reader's checkpoint cut.
+      replaySnapshots.snapshot(checkpointId, checkpoint);
+    }
+    return checkpoint.build();
   }
 
   @Override
-  public void close() {}
+  public void notifyCheckpointComplete(long checkpointId) {
+    if (replaySnapshots != null) {
+      replaySnapshots.notifyCheckpointComplete(checkpointId);
+    }
+  }
+
+  @Override
+  public void notifyCheckpointAborted(long checkpointId) {
+    if (replaySnapshots != null) {
+      replaySnapshots.notifyCheckpointAborted(checkpointId);
+    }
+  }
+
+  @Override
+  public void close() {
+    if (replaySnapshots != null) {
+      replaySnapshots.close();
+    }
+  }
 
   private void checkForUnassignedReaders() {
     // Remove all assignments for readers that are no longer registered.
