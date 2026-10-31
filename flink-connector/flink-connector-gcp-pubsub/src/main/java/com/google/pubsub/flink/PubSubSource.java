@@ -110,7 +110,6 @@ public abstract class PubSubSource<OutputT>
     String emulatorEndpoint = EmulatorEndpoint.getEmulatorEndpoint(endpoint());
     if (emulatorEndpoint != null) {
       builder.setCredentialsProvider(NoCredentialsProvider.create());
-      builder.setEndpoint(emulatorEndpoint);
     }
     builder.setChannelProvider(createChannelProvider(emulatorEndpoint));
     return builder.build();
@@ -160,10 +159,9 @@ public abstract class PubSubSource<OutputT>
             return null;
           }
         });
-    MetricGroup metrics = readerContext.metricGroup().addGroup("pubsub");
     return new PubSubSourceReader<>(
         schema,
-        new PubSubAckTracker(metrics),
+        new PubSubAckTracker(readerContext.metricGroup().addGroup("pubsub")),
         this::createSplitReader,
         new Configuration(),
         readerContext);

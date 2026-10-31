@@ -36,7 +36,7 @@ public class PubSubPublisherExecutor extends ScheduledThreadPoolExecutor {
       Runnable callback, RunnableScheduledFuture<V> scheduled) {
     // GAX wraps callback Futures in a separate scheduled Future, so cancel both (verified on
     // google-cloud-pubsub 1.133.1 / GAX 2.55.0; PubSubPublisherShutdownIT guards this).
-    if (callback instanceof Future<?>) callbacks.put(scheduled, (Future<?>) callback);
+    if (callback instanceof Future<?> f) callbacks.put(scheduled, f);
     return scheduled;
   }
 
@@ -52,7 +52,7 @@ public class PubSubPublisherExecutor extends ScheduledThreadPoolExecutor {
     for (Runnable task : discarded) {
       Future<?> callback = callbacks.remove(task);
       if (callback != null) callback.cancel(false);
-      if (task instanceof Future<?>) ((Future<?>) task).cancel(false);
+      if (task instanceof Future<?> f) f.cancel(false);
     }
     return discarded;
   }

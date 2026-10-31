@@ -139,11 +139,7 @@ public class PubSubAckTracker implements AckTracker {
   }
 
   private synchronized int outstandingDeliveryHandles() {
-    int count = 0;
-    for (Delivery delivery : outstandingAcks.values()) {
-      count += delivery.consumers.size();
-    }
-    return count;
+    return outstandingAcks.values().stream().mapToInt(d -> d.consumers.size()).sum();
   }
 
   private synchronized int pendingMessages() {

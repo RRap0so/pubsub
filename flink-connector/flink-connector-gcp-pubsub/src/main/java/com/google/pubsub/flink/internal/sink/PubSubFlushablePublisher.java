@@ -85,6 +85,9 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     this.executor = executor;
     this.callbackExecutor = callbackExecutor;
     this.closeTimeoutNanos = unit.toNanos(closeTimeout);
+    if (publisher != null) {
+      owned.add(new OwnedResource("publisher", publisher::shutdown, publisher::awaitTermination));
+    }
     if (transport != null) {
       owned.add(new OwnedResource("transport", transport::shutdown, transport::awaitTermination));
     }
@@ -197,22 +200,13 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
       failure = new IOException("Unable to flush Pub/Sub publisher during close", failed);
     } finally {
       try {
-        shutdownAll(closeStarted);
+        shutdownPublisher(closeStarted);
       } catch (IOException shutdownFailure) {
         failure = withSuppressed(failure, shutdownFailure);
       }
     }
     if (failure != null) {
       throw failure;
-    }
-  }
-
-  private void shutdownAll(long closeStarted) throws IOException {
-    try {
-      shutdownPublisher(closeStarted);
-    } finally {
-      // Callbacks must outlive the publisher's shutdown wait, so this executor closes last.
-      if (callbackExecutor != null) callbackExecutor.shutdownNow();
     }
   }
 
@@ -225,17 +219,16 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
 
   private void shutdownPublisher(long closeStarted) throws IOException {
     try {
-      publisher.shutdown();
-      for (OwnedResource resource : owned) resource.shutdown.run();
-      awaitTermination("publisher", publisher::awaitTermination, closeStarted);
-      for (OwnedResource resource : owned) {
-        awaitTermination(resource.name, resource.await, closeStarted);
-      }
+      for (OwnedResource r : owned) r.shutdown().run();
+      for (OwnedResource r : owned) awaitTermination(r.name(), r.await(), closeStarted);
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
       throw new IOException("Interrupted while closing Pub/Sub publisher", interrupted);
     } catch (RuntimeException failure) {
       throw new IOException("Unable to shut down Pub/Sub publisher", failure);
+    } finally {
+      // Callbacks must outlive the publisher's shutdown wait, so this executor closes last.
+      if (callbackExecutor != null) callbackExecutor.shutdownNow();
     }
   }
 
@@ -270,7 +263,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   }
 
   private void forceResources(Throwable failure) {
-    // The callback executor is left to the worker; see shutdownAll.
+    // The callback executor is left to the worker; see shutdownPublisher.
     forceCloseResources(failure, transport, executor);
   }
 
@@ -303,17 +296,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException;
   }
 
-  private static final class OwnedResource {
-    final String name;
-    final Runnable shutdown;
-    final Terminable await;
-
-    OwnedResource(String name, Runnable shutdown, Terminable await) {
-      this.name = name;
-      this.shutdown = shutdown;
-      this.await = await;
-    }
-  }
+  private record OwnedResource(String name, Runnable shutdown, Terminable await) {}
 
   private void awaitTermination(String name, Terminable resource, long closeStarted)
       throws IOException, InterruptedException {

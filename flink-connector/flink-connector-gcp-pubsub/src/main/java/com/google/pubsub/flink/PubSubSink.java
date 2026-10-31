@@ -112,12 +112,9 @@ public abstract class PubSubSink<T> implements Sink<T> {
   }
 
   ScheduledExecutorService createExecutor() {
-    var defaults =
-        TopicAdminSettings.defaultExecutorProviderBuilder()
-            .setExecutorThreadCount(PUBLISHER_THREADS)
-            .build();
     return new PubSubPublisherExecutor(
-        defaults.getExecutorThreadCount(), defaults.getThreadFactory());
+        PUBLISHER_THREADS,
+        TopicAdminSettings.defaultExecutorProviderBuilder().build().getThreadFactory());
   }
 
   ScheduledExecutorService createCallbackExecutor() {
