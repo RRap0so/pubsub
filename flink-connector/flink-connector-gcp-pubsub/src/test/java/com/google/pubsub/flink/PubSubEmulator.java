@@ -16,13 +16,16 @@
 package com.google.pubsub.flink;
 
 import org.testcontainers.containers.PubSubEmulatorContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 
 /** One Pub/Sub emulator container shared by all integration tests in the JVM. Requires Docker. */
 final class PubSubEmulator {
   private static final PubSubEmulatorContainer CONTAINER =
       new PubSubEmulatorContainer(
-          DockerImageName.parse("gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators"));
+              DockerImageName.parse("gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators"))
+          // The port opens before the emulator answers HTTP; wait for a real response.
+          .waitingFor(Wait.forHttp("/v1/projects/probe/topics").forStatusCode(200));
 
   static {
     // Testcontainers removes the container when the JVM exits.
