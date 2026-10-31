@@ -48,6 +48,9 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   private final TransportChannel transport;
   private final ScheduledExecutorService executor;
   private final ScheduledExecutorService callbackExecutor;
+  // TODO: This keeps every publish future until the next checkpoint, so memory grows with
+  // throughput x checkpoint interval. Track completions as they happen instead (in-flight count
+  // plus first failure) so flush waits only for publishes still in flight.
   private final List<ApiFuture<String>> outstandingPublishes = new ArrayList<>();
   private final long closeTimeoutNanos;
   private volatile boolean closed;
