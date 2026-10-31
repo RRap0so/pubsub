@@ -183,24 +183,32 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
       failure = new IOException("Unable to flush Pub/Sub publisher during close", failed);
     } finally {
       try {
-        try {
-          shutdownPublisher(closeStarted);
-        } finally {
-          // Cancellation callbacks must stay runnable until shutdown's pending-publish waiter
-          // finishes. This executor is separate from the retry scheduler aborted by the caller.
-          if (callbackExecutor != null) callbackExecutor.shutdownNow();
-        }
-      } catch (IOException cleanupFailure) {
-        if (failure == null) {
-          failure = cleanupFailure;
-        } else {
-          failure.addSuppressed(cleanupFailure);
-        }
+        shutdownAll(closeStarted);
+      } catch (IOException shutdownFailure) {
+        failure = withSuppressed(failure, shutdownFailure);
       }
     }
     if (failure != null) {
       throw failure;
     }
+  }
+
+  /** Shuts down the publisher, then always the callback executor. */
+  private void shutdownAll(long closeStarted) throws IOException {
+    try {
+      shutdownPublisher(closeStarted);
+    } finally {
+      // Cancellation callbacks must stay runnable until shutdown's pending-publish waiter
+      // finishes. This executor is separate from the retry scheduler aborted by the caller.
+      if (callbackExecutor != null) callbackExecutor.shutdownNow();
+    }
+  }
+
+  /** Returns the first failure, with any later one attached as suppressed. */
+  private static IOException withSuppressed(IOException primary, IOException later) {
+    if (primary == null) return later;
+    primary.addSuppressed(later);
+    return primary;
   }
 
   private void shutdownPublisher(long closeStarted) throws IOException {
