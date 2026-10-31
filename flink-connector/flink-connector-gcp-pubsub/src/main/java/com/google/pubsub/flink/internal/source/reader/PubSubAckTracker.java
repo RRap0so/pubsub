@@ -139,7 +139,7 @@ public class PubSubAckTracker implements AckTracker {
   }
 
   private synchronized int outstandingDeliveryHandles() {
-    return outstandingAcks.values().stream().mapToInt(d -> d.consumers.size()).sum();
+    return outstandingAcks.values().stream().mapToInt(Delivery::size).sum();
   }
 
   private synchronized int pendingMessages() {
@@ -162,8 +162,10 @@ public class PubSubAckTracker implements AckTracker {
   }
 
   private static final class Delivery {
-    final Deque<AckReplyConsumer> consumers = new ArrayDeque<>();
-    final Set<AckReplyConsumer> handles = Collections.newSetFromMap(new IdentityHashMap<>());
+    // Almost every message has a single handle, so the deque and set are allocated lazily.
+    private AckReplyConsumer only;
+    private Deque<AckReplyConsumer> consumers;
+    private Set<AckReplyConsumer> handles;
     final long receivedNanos;
 
     Delivery(AckReplyConsumer consumer, long receivedNanos) {
@@ -171,7 +173,22 @@ public class PubSubAckTracker implements AckTracker {
       this.receivedNanos = receivedNanos;
     }
 
+    int size() {
+      return consumers != null ? consumers.size() : only != null ? 1 : 0;
+    }
+
     void add(AckReplyConsumer consumer) {
+      if (consumers == null) {
+        if (only == null || only == consumer) {
+          only = consumer;
+          return;
+        }
+        consumers = new ArrayDeque<>();
+        handles = Collections.newSetFromMap(new IdentityHashMap<>());
+        consumers.addFirst(only);
+        handles.add(only);
+        only = null;
+      }
       if (!handles.add(consumer)) {
         // The same handle can arrive again; keep one copy at its newest position.
         consumers.removeIf(existing -> existing == consumer);
@@ -180,15 +197,26 @@ public class PubSubAckTracker implements AckTracker {
     }
 
     void resolve(boolean acknowledge) {
+      if (consumers == null) {
+        if (only != null) {
+          settle(only, acknowledge);
+          only = null;
+        }
+        return;
+      }
       while (!consumers.isEmpty()) {
         AckReplyConsumer consumer = consumers.peekFirst();
-        if (acknowledge) {
-          consumer.ack();
-        } else {
-          consumer.nack();
-        }
+        settle(consumer, acknowledge);
         consumers.removeFirst();
         handles.remove(consumer);
+      }
+    }
+
+    private static void settle(AckReplyConsumer consumer, boolean acknowledge) {
+      if (acknowledge) {
+        consumer.ack();
+      } else {
+        consumer.nack();
       }
     }
   }
