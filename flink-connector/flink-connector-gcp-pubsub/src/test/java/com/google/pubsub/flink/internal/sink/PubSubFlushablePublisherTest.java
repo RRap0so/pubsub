@@ -276,16 +276,14 @@ public class PubSubFlushablePublisherTest {
   }
 
   @Test
-  public void flush_preservesInterruptionAndDoesNotForgetOutstandingPublish() throws Exception {
+  public void flush_propagatesInterruptionAndDoesNotForgetOutstandingPublish() throws Exception {
     PubsubMessage message = PubsubMessage.getDefaultInstance();
     var result = SettableApiFuture.<String>create();
     when(mockPublisher.publish(message)).thenReturn(result);
     flushablePublisher.publish(message);
     try {
       Thread.currentThread().interrupt();
-      IOException failure = assertThrows(IOException.class, flushablePublisher::flush);
-      assertThat(failure).hasCauseThat().isInstanceOf(InterruptedException.class);
-      assertThat(Thread.currentThread().isInterrupted()).isTrue();
+      assertThrows(InterruptedException.class, flushablePublisher::flush);
     } finally {
       Thread.interrupted();
     }

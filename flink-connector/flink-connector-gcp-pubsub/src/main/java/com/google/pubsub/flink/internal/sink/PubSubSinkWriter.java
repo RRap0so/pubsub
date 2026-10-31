@@ -34,7 +34,7 @@ public class PubSubSinkWriter<T> implements SinkWriter<T> {
   }
 
   @Override
-  public void flush(boolean endOfInput) throws IOException {
+  public void flush(boolean endOfInput) throws IOException, InterruptedException {
     publisher.flush();
   }
 

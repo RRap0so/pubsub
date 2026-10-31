@@ -99,21 +99,18 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   }
 
   @Override
-  public void flush() throws IOException {
+  public void flush() throws IOException, InterruptedException {
     if (closed) {
       throw new IOException("Publisher is closed");
     }
     flushOutstanding();
   }
 
-  private void flushOutstanding() throws IOException {
+  private void flushOutstanding() throws IOException, InterruptedException {
     publisher.publishAllOutstanding();
     try {
       ApiFutures.allAsList(outstandingPublishes).get();
       outstandingPublishes.clear();
-    } catch (InterruptedException interrupted) {
-      Thread.currentThread().interrupt();
-      throw new IOException("Interrupted while waiting for Pub/Sub publishes", interrupted);
     } catch (ExecutionException failed) {
       throw new IOException("Pub/Sub publish failed", failed.getCause());
     } catch (CancellationException cancelled) {
@@ -179,6 +176,10 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
       flushOutstanding();
     } catch (IOException failed) {
       failure = failed;
+    } catch (InterruptedException interrupted) {
+      // The worker is interrupted when the caller gives up; still run shutdown below.
+      Thread.currentThread().interrupt();
+      failure = new IOException("Interrupted while flushing Pub/Sub publisher", interrupted);
     } catch (RuntimeException failed) {
       failure = new IOException("Unable to flush Pub/Sub publisher during close", failed);
     } finally {
