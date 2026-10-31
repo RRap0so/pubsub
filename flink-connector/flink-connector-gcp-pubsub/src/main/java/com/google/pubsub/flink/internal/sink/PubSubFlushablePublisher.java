@@ -23,7 +23,6 @@ import com.google.pubsub.v1.PubsubMessage;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -128,9 +127,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     }
     closed = true;
     long closeStarted = System.nanoTime();
-    String topic = publisher.getTopicNameString();
-    String topicId = topic == null ? "unknown" : topic.substring(topic.lastIndexOf('/') + 1);
-    String workerName = "pubsub-publisher-close-" + topicId + "-" + UUID.randomUUID();
+    String workerName = "pubsub-publisher-close-" + publisher.getTopicNameString();
     CompletableFuture<Void> cleanup = new CompletableFuture<>();
     Thread worker =
         new Thread(
