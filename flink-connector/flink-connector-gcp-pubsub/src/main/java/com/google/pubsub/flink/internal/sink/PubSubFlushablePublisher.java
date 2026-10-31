@@ -19,6 +19,7 @@ import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
 import com.google.api.gax.rpc.TransportChannel;
 import com.google.cloud.pubsub.v1.Publisher;
+import com.google.common.base.Throwables;
 import com.google.pubsub.v1.PubsubMessage;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -147,29 +148,27 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     try {
       cleanup.get(remainingNanos(closeStarted), TimeUnit.NANOSECONDS);
     } catch (TimeoutException timedOut) {
-      IOException failure =
+      throw abandon(
+          worker,
+          cleanup,
+          closeStarted,
           new IOException(
               "Pub/Sub publisher close did not finish within "
                   + TimeUnit.NANOSECONDS.toMillis(closeTimeoutNanos)
                   + " ms",
-              timedOut);
-      detachCleanup(worker, cleanup, closeStarted, failure);
-      throw failure;
+              timedOut));
     } catch (InterruptedException interrupted) {
-      IOException failure =
-          new IOException("Interrupted while closing Pub/Sub publisher", interrupted);
-      detachCleanup(worker, cleanup, closeStarted, failure);
       Thread.currentThread().interrupt();
-      throw failure;
+      throw abandon(
+          worker,
+          cleanup,
+          closeStarted,
+          new IOException("Interrupted while closing Pub/Sub publisher", interrupted));
     } catch (ExecutionException failed) {
       Throwable cause = failed.getCause();
       forceResources(cause);
-      if (cause instanceof IOException) {
-        throw (IOException) cause;
-      }
-      if (cause instanceof Error) {
-        throw (Error) cause;
-      }
+      Throwables.throwIfInstanceOf(cause, IOException.class);
+      Throwables.throwIfInstanceOf(cause, Error.class);
       throw new IOException("Unable to close Pub/Sub publisher", cause);
     }
   }
@@ -234,7 +233,8 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
     return Math.max(0, closeTimeoutNanos - (System.nanoTime() - closeStarted));
   }
 
-  private void detachCleanup(
+  /** Stops waiting for the cleanup worker, aborts owned resources, and returns {@code failure}. */
+  private IOException abandon(
       Thread worker, CompletableFuture<Void> cleanup, long closeStarted, IOException failure) {
     LOG.warn(
         "Publisher cleanup worker {} is still draining after {} ms; aborting owned resources",
@@ -257,6 +257,7 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
                 error);
           }
         });
+    return failure;
   }
 
   private void forceResources(Throwable failure) {
