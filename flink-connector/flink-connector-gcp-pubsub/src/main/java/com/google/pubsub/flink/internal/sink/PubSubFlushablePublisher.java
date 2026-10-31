@@ -272,19 +272,28 @@ public class PubSubFlushablePublisher implements FlushablePublisher {
   @Internal
   public static void forceCloseResources(
       Throwable failure, TransportChannel transport, ExecutorService... executors) {
-    if (transport != null) shutdownNow(failure, transport::shutdownNow);
+    Error fatal = null;
+    if (transport != null) fatal = shutdownNow(failure, fatal, transport::shutdownNow);
     for (ExecutorService executor : executors) {
-      if (executor != null) shutdownNow(failure, executor::shutdownNow);
+      if (executor != null) fatal = shutdownNow(failure, fatal, executor::shutdownNow);
     }
+    if (fatal != null) throw fatal;
   }
 
-  /** Runs one cleanup step; a failure is recorded on {@code failure} and does not stop the rest. */
-  private static void shutdownNow(Throwable failure, Runnable cleanup) {
+  /**
+   * Runs one cleanup step without stopping the rest. Exceptions are recorded on {@code failure};
+   * the first {@link Error} is returned so the caller can rethrow it once every step has run.
+   */
+  private static Error shutdownNow(Throwable failure, Error fatal, Runnable cleanup) {
     try {
       cleanup.run();
     } catch (RuntimeException cleanupFailure) {
       if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+    } catch (Error error) {
+      if (fatal == null) return error;
+      fatal.addSuppressed(error);
     }
+    return fatal;
   }
 
   private interface Terminable {

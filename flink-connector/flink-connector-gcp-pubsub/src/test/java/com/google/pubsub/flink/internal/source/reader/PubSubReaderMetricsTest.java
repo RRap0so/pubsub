@@ -210,10 +210,10 @@ public class PubSubReaderMetricsTest {
     AckReplyConsumer original = mock(AckReplyConsumer.class);
     AckReplyConsumer latest = mock(AckReplyConsumer.class);
     org.mockito.Mockito.doThrow(new IllegalStateException("Callback failure")).when(original).ack();
-    tracker.trackMessageDelivery("A", original);
-    tracker.trackMessageDelivery("A", latest);
-    tracker.trackMessageDelivery("A", original);
-    tracker.trackMessageDelivery("A", latest);
+    tracker.addPendingAck("A", original);
+    tracker.addPendingAck("A", latest);
+    tracker.addPendingAck("A", original);
+    tracker.addPendingAck("A", latest);
     assertThat(group.value("outstandingMessages")).isEqualTo(1);
     assertThat(group.value("outstandingDeliveryHandles")).isEqualTo(2);
     tracker.stagePendingAck("A");

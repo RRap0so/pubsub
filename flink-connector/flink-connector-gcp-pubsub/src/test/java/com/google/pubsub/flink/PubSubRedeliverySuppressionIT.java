@@ -115,7 +115,7 @@ public class PubSubRedeliverySuppressionIT {
       AtomicInteger nackRequests = new AtomicInteger();
       List<Integer> ackStatuses = new ArrayList<>();
       assertTrue(
-          tracker.trackMessageDelivery(
+          tracker.addPendingAck(
               messageId,
               redeliveryConsumer(
                   subscription, first.getAckId(), exactlyOnce, nackRequests, ackStatuses)));
@@ -129,7 +129,7 @@ public class PubSubRedeliverySuppressionIT {
       ReceivedMessage second = nextDelivery(subscription, messageId);
       assertTrue("Redelivery must have a new ACK ID", !first.getAckId().equals(second.getAckId()));
       assertTrue(
-          !tracker.trackMessageDelivery(
+          !tracker.addPendingAck(
               messageId,
               redeliveryConsumer(
                   subscription, second.getAckId(), exactlyOnce, nackRequests, ackStatuses)));
@@ -145,7 +145,7 @@ public class PubSubRedeliverySuppressionIT {
           "{\"ackIds\":[\"" + second.getAckId() + "\"],\"ackDeadlineSeconds\":0}");
       ReceivedMessage third = nextDelivery(subscription, messageId);
       assertTrue(
-          !tracker.trackMessageDelivery(
+          !tracker.addPendingAck(
               messageId,
               redeliveryConsumer(
                   subscription, third.getAckId(), exactlyOnce, nackRequests, ackStatuses)));

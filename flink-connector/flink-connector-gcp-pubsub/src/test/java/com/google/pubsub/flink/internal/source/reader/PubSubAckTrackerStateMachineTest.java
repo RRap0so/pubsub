@@ -58,7 +58,7 @@ public class PubSubAckTrackerStateMachineTest {
           assertEquals(
               context + " first delivery",
               first,
-              tracker.trackMessageDelivery(id, consumer(token, actual)));
+              tracker.addPendingAck(id, consumer(token, actual)));
           break;
         case 2:
           tracker.stagePendingAck(id);

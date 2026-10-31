@@ -17,7 +17,9 @@ package com.google.pubsub.flink.internal.source.reader;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -38,8 +40,7 @@ import org.mockito.junit.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
 public class PubSubNotifyingPullSubscriberTest {
-  @Mock(answer = org.mockito.Answers.CALLS_REAL_METHODS)
-  AckTracker mockAckTracker;
+  @Mock AckTracker mockAckTracker;
 
   @Mock Subscriber mockSubscriber;
 
@@ -49,6 +50,7 @@ public class PubSubNotifyingPullSubscriberTest {
 
   @Before
   public void doBeforeEachTest() {
+    lenient().when(mockAckTracker.addPendingAck(any(), any())).thenReturn(true);
     when(mockSubscriber.startAsync()).thenReturn(mockSubscriber);
     pullSubscriber =
         new PubSubNotifyingPullSubscriber(

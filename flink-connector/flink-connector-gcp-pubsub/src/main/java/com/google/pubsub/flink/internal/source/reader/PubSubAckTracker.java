@@ -75,8 +75,7 @@ public class PubSubAckTracker implements AckTracker {
   private final SortedMap<Long, List<String>> checkpoints = new TreeMap<>();
 
   @Override
-  public synchronized boolean trackMessageDelivery(
-      String messageId, AckReplyConsumer ackReplyConsumer) {
+  public synchronized boolean addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer) {
     Delivery delivery = outstandingAcks.get(messageId);
     if (delivery == null) {
       outstandingAcks.put(messageId, new Delivery(ackReplyConsumer, nanoTime.getAsLong()));
@@ -89,11 +88,6 @@ public class PubSubAckTracker implements AckTracker {
     delivery.add(ackReplyConsumer);
     redeliveries.inc();
     return false;
-  }
-
-  @Override
-  public void addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer) {
-    trackMessageDelivery(messageId, ackReplyConsumer);
   }
 
   @Override

@@ -20,27 +20,14 @@ import com.google.cloud.pubsub.v1.AckReplyConsumer;
 /** This class tracks the lifecycle of messages in {@link com.google.pubsub.flink.PubSubSource}. */
 public interface AckTracker {
   /**
-   * Track a delivery and return whether its message should be emitted.
+   * Track a new pending ack and return whether the message should be emitted. Acks are pending when
+   * a message has been received but not yet processed by the Flink pipeline.
    *
-   * <p>Implementations may suppress redeliveries of a message still awaiting checkpoint
-   * acknowledgement, while retaining every delivery's acknowledgement handle until checkpoint
-   * completion or shutdown. The default preserves the behavior of trackers that do not suppress
-   * redeliveries.
+   * <p>A redelivery of a message that is still tracked returns {@code false}. Its handle is kept
+   * and resolved together with the original at checkpoint completion or shutdown, never earlier: an
+   * early ACK would precede the checkpoint, and an early NACK can trigger a redelivery loop.
    */
-  default boolean trackMessageDelivery(String messageId, AckReplyConsumer ackReplyConsumer) {
-    addPendingAck(messageId, ackReplyConsumer);
-    return true;
-  }
-
-  /**
-   * Track a new pending ack. Acks are pending when a message has been received but not yet
-   * processed by the Flink pipeline.
-   *
-   * <p>Implementations that suppress redeliveries retain superseded handles and resolve them no
-   * later than checkpoint completion or shutdown. Resolving a handle early can acknowledge input
-   * before its checkpoint or trigger a redelivery loop.
-   */
-  void addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer);
+  boolean addPendingAck(String messageId, AckReplyConsumer ackReplyConsumer);
 
   /**
    * Stage a pending ack for the next checkpoint snapshot. Staged acks indicate that a message has
